@@ -34,6 +34,12 @@ extern "C"
 
     GLuint find_bound_buffer(GLenum key);
 
+    // Returns the driver-side buffer name currently bound to `target`. This
+    // differs from find_bound_buffer() (which returns the tracked/client-side
+    // name) when the CPU emulation layer has substituted a real driver buffer
+    // for a client-owned buffer name.
+    GLuint mg_driver_bound_buffer(GLenum target);
+
     void set_bound_buffer_by_target(GLenum target, GLuint buffer);
 
     // --- PBO CPU shadow data (for BGRA swizzle without glMapBufferRange read) ---
