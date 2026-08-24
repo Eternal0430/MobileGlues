@@ -29,6 +29,21 @@ GLsizei pixel_sizeof(GLenum format, GLenum type);
 GLboolean is_type_packed(GLenum type);
 
 // ============================================================================
+// Desktop-only pixel-store parameters (ported from upstream gl/pixel.h)
+//
+// GLES 3.2 has no GL_{UNPACK,PACK}_SWAP_BYTES / _LSB_FIRST and no 3D
+// pack skip/image-height parameters: both directions earn GL_INVALID_ENUM.
+// Both directions go through here so a value that was set can be read back;
+// the values live in the per-context gl_state_s (gl/mg.h).
+//
+// Each returns true when pname is one of those six, which is the caller's
+// signal to stop -- forwarding any of them to the driver only earns
+// GL_INVALID_ENUM.
+// ============================================================================
+bool mg_pixel_store_set(GLenum pname, GLint param);
+bool mg_pixel_store_query_int(GLenum pname, GLint* out);
+
+// ============================================================================
 // BGRA <=> RGBA Swizzle Helpers
 //
 // Design adapted from MobileGL-DirectGLES branch (MG_Util/Texture/PixelStoreProcessor).

@@ -200,6 +200,22 @@ void InitGLESCapabilities() {
                 g_gles_caps.KHR_texture_compression_astc_ldr = 1;
             } else if (strcmp(extension, "GL_EXT_texture_filter_anisotropic") == 0) {
                 g_gles_caps.EXT_texture_filter_anisotropic = 1;
+            } else if (strcmp(extension, "GL_OES_draw_elements_base_vertex") == 0) {
+                g_gles_caps.GL_OES_draw_elements_base_vertex = 1;
+            } else if (strcmp(extension, "GL_EXT_draw_elements_base_vertex") == 0) {
+                g_gles_caps.GL_EXT_draw_elements_base_vertex = 1;
+            } else if (strcmp(extension, "GL_EXT_multisample_compatibility") == 0) {
+                g_gles_caps.GL_EXT_multisample_compatibility = 1;
+            } else if (strcmp(extension, "GL_EXT_clip_cull_distance") == 0) {
+                g_gles_caps.GL_EXT_clip_cull_distance = 1;
+            } else if (strcmp(extension, "GL_EXT_depth_clamp") == 0) {
+                g_gles_caps.GL_EXT_depth_clamp = 1;
+            } else if (strcmp(extension, "GL_EXT_sRGB_write_control") == 0) {
+                g_gles_caps.GL_EXT_sRGB_write_control = 1;
+            } else if (strcmp(extension, "GL_NV_polygon_mode") == 0) {
+                g_gles_caps.GL_NV_polygon_mode = 1;
+            } else if (strcmp(extension, "GL_OES_sample_shading") == 0) {
+                g_gles_caps.GL_OES_sample_shading = 1;
             } else if (strcmp(extension, "GL_EXT_color_buffer_float") == 0) {
                 // Required for RGBA32F / R11F_G11F_B10F / RGB32F / RG32F / R32F
                 // as color-renderable FBO attachments. Without it, GLES drivers

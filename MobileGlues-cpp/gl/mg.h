@@ -19,6 +19,48 @@
 extern void* g_loader_handle;
 
 // ============================================================================
+// Per-context scalar GL state (ported from upstream mg.h for egl/context.h)
+//
+// Upstream moved this state INTO the per-context MGContext record
+// (`gl_state_s gl;` member). This fork still drives its global GLStateManager,
+// so the struct is defined here -- BEFORE the legacy #define aliases below,
+// whose bodies would otherwise rewrite these snake_case member names.
+//
+// NOTE: when the port of egl/context.cpp resumes it also needs the
+// thread_local `gl_state` POINTER from upstream mg.h; that name currently
+// collides with the `#define gl_state (&GLState)` alias below and must be
+// reconciled as part of that port.
+// ============================================================================
+struct gl_state_s {
+    GLsizei proxy_width;
+    GLsizei proxy_height;
+    GLenum proxy_intformat;
+
+    GLuint current_program;
+    GLuint current_tex_unit;
+    GLuint current_draw_fbo;
+
+    // The six pixel-store parameters desktop GL has and GLES does not (see
+    // upstream mg.h). GLES answers GL_INVALID_ENUM for all six in both
+    // directions; they are tracked here so they can be set and read back.
+    GLint unpack_swap_bytes;
+    GLint unpack_lsb_first;
+    GLint pack_swap_bytes;
+    GLint pack_lsb_first;
+    GLint pack_image_height;
+    GLint pack_skip_images;
+
+    // Default constructor matching the zero-initialised fallback state.
+    gl_state_s()
+        : proxy_width(0), proxy_height(0), proxy_intformat(0),
+          current_program(0), current_tex_unit(0), current_draw_fbo(0),
+          unpack_swap_bytes(0), unpack_lsb_first(0),
+          pack_swap_bytes(0), pack_lsb_first(0),
+          pack_image_height(0), pack_skip_images(0) {}
+};
+typedef struct gl_state_s* gl_state_t;
+
+// ============================================================================
 // Backward-compatible #define macros for old code
 // ============================================================================
 // NOTE: Removed legacy aliases that had no remaining callers in the codebase:

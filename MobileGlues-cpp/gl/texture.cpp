@@ -2285,6 +2285,13 @@ void glClearTexImage(GLuint texture, GLint level, GLenum format, GLenum type, co
 
 void glPixelStorei(GLenum pname, GLint param) {
     LOG_D("glPixelStorei, pname = %s, param = %d", glEnumToString(pname), param)
+    // The six desktop-only pixel-store parameters are answered from the
+    // per-context mirror (see gl/pixel.cpp): GLES rejects all six with
+    // GL_INVALID_ENUM in both directions, so they must not reach the driver.
+    if (mg_pixel_store_set(pname, param)) {
+        CHECK_GL_ERROR
+        return;
+    }
     GLES.glPixelStorei(pname, param);
     // Keep CPU-side cache in sync to avoid glGetIntegerv GPU round-trips
     switch (pname) {
