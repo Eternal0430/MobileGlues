@@ -2989,6 +2989,18 @@ GLAPI void APIENTRY glClampColorARB (GLenum target, GLenum clamp);
 #define GL_ARB_compute_shader 1
 #endif /* GL_ARB_compute_shader */
 
+#ifndef GL_ARB_compute_variable_group_size
+#define GL_ARB_compute_variable_group_size 1
+#define GL_MAX_COMPUTE_VARIABLE_GROUP_INVOCATIONS_ARB 0x9344
+#define GL_MAX_COMPUTE_FIXED_GROUP_INVOCATIONS_ARB 0x90EB
+#define GL_MAX_COMPUTE_VARIABLE_GROUP_SIZE_ARB 0x9345
+#define GL_MAX_COMPUTE_FIXED_GROUP_SIZE_ARB 0x91BF
+typedef void (APIENTRYP PFNGLDISPATCHCOMPUTEGROUPSIZEARBPROC) (GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z, GLuint group_size_x, GLuint group_size_y, GLuint group_size_z);
+#ifdef GL_GLEXT_PROTOTYPES
+GLAPI void APIENTRY glDispatchComputeGroupSizeARB (GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z, GLuint group_size_x, GLuint group_size_y, GLuint group_size_z);
+#endif
+#endif /* GL_ARB_compute_variable_group_size */
+
 #ifndef GL_ARB_conditional_render_inverted
 #define GL_ARB_conditional_render_inverted 1
 #endif /* GL_ARB_conditional_render_inverted */
@@ -8667,40 +8679,6 @@ GLAPI void APIENTRY glGetQueryObjecti64vEXT (GLuint id, GLenum pname, GLint64 *p
 GLAPI void APIENTRY glGetQueryObjectui64vEXT (GLuint id, GLenum pname, GLuint64 *params);
 #endif
 #endif /* GL_EXT_timer_query */
-
-#ifndef GL_EXT_disjoint_timer_query
-#define GL_EXT_disjoint_timer_query 1
-#define GL_QUERY_COUNTER_BITS_EXT          0x8864
-#define GL_CURRENT_QUERY_EXT               0x8865
-#define GL_QUERY_RESULT_EXT                0x8866
-#define GL_QUERY_RESULT_AVAILABLE_EXT      0x8867
-#define GL_TIME_ELAPSED_EXT                0x88BF
-#define GL_TIMESTAMP_EXT                   0x8E28
-typedef void (APIENTRYP PFNGLGENQUERIESEXTPROC) (GLsizei n, GLuint *ids);
-typedef void (APIENTRYP PFNGLDELETEQUERIESEXTPROC) (GLsizei n, const GLuint *ids);
-typedef GLboolean (APIENTRYP PFNGLISQUERYEXTPROC) (GLuint id);
-typedef void (APIENTRYP PFNGLBEGINQUERYEXTPROC) (GLenum target, GLuint id);
-typedef void (APIENTRYP PFNGLENDQUERYEXTPROC) (GLenum target);
-typedef void (APIENTRYP PFNGLQUERYCOUNTEREXTPROC) (GLuint id, GLenum target);
-typedef void (APIENTRYP PFNGLGETQUERYIVEXTPROC) (GLenum target, GLenum pname, GLint *params);
-typedef void (APIENTRYP PFNGLGETQUERYOBJECTIVEXTPROC) (GLuint id, GLenum pname, GLint *params);
-typedef void (APIENTRYP PFNGLGETQUERYOBJECTUIVEXTPROC) (GLuint id, GLenum pname, GLuint *params);
-typedef void (APIENTRYP PFNGLGETQUERYOBJECTI64VEXTPROC) (GLuint id, GLenum pname, GLint64 *params);
-typedef void (APIENTRYP PFNGLGETQUERYOBJECTUI64VEXTPROC) (GLuint id, GLenum pname, GLuint64 *params);
-#ifdef GL_GLEXT_PROTOTYPES
-GLAPI void APIENTRY glGenQueriesEXT (GLsizei n, GLuint *ids);
-GLAPI void APIENTRY glDeleteQueriesEXT (GLsizei n, const GLuint *ids);
-GLAPI GLboolean APIENTRY glIsQueryEXT (GLuint id);
-GLAPI void APIENTRY glBeginQueryEXT (GLenum target, GLuint id);
-GLAPI void APIENTRY glEndQueryEXT (GLenum target);
-GLAPI void APIENTRY glQueryCounterEXT (GLuint id, GLenum target);
-GLAPI void APIENTRY glGetQueryivEXT (GLenum target, GLenum pname, GLint *params);
-GLAPI void APIENTRY glGetQueryObjectivEXT (GLuint id, GLenum pname, GLint *params);
-GLAPI void APIENTRY glGetQueryObjectuivEXT (GLuint id, GLenum pname, GLuint *params);
-GLAPI void APIENTRY glGetQueryObjecti64vEXT (GLuint id, GLenum pname, GLint64 *params);
-GLAPI void APIENTRY glGetQueryObjectui64vEXT (GLuint id, GLenum pname, GLuint64 *params);
-#endif
-#endif /* GL_EXT_disjoint_timer_query */
 
 #ifndef GL_EXT_transform_feedback
 #define GL_EXT_transform_feedback 1

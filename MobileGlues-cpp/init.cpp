@@ -5,19 +5,10 @@
 // SPDX-License-Identifier: LGPL-2.1-only
 // End of Source File Header
 
-// ============================================================================
-// Initialization Order (ES 3.2 target)
-//
-//  1. proc_init()     — main.cpp: config, logging, load libs, EGL, GLES
-// ============================================================================
-
 #include "includes.h"
-#include "gl/mg.h"
 
 struct static_block_t {
-    static_block_t() {
-        proc_init();
-    }
+    static_block_t() { proc_init(); }
 };
 
 static static_block_t static_block;
