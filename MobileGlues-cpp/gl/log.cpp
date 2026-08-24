@@ -11,12 +11,74 @@
 
 #include <GL/gl.h>
 
+#include "../config/config.h"
+#include <cstdarg>
+#include <cstdio>
+
 #ifndef __ANDROID__
 // Define a stub for __android_log_print if not on Android
 int __android_log_print(int prio, const char* tag, const char* fmt, ...) {
     return 0; // Do nothing
 }
 #endif
+
+// --- Log file implementation (writes to log_file_path, e.g. /sdcard/MG/latest.log) ---
+static FILE* g_log_fp = nullptr;
+static std::mutex g_log_mutex;
+
+// Opens the log file for appending on demand. Must be called with g_log_mutex held.
+static FILE* log_open_locked() {
+    if (g_log_fp) return g_log_fp;
+    if (log_file_path) {
+        g_log_fp = fopen(log_file_path, "a");
+    }
+    return g_log_fp;
+}
+
+void clear_log() {
+    std::lock_guard<std::mutex> guard(g_log_mutex);
+    if (g_log_fp) {
+        fclose(g_log_fp);
+        g_log_fp = nullptr;
+    }
+    if (log_file_path) {
+        // Truncate the previous session's log
+        FILE* fp = fopen(log_file_path, "w");
+        if (fp) {
+            fclose(fp);
+        }
+    }
+}
+
+void start_log() {
+    std::lock_guard<std::mutex> guard(g_log_mutex);
+    log_open_locked();
+}
+
+void write_log(const char* fmt, ...) {
+    std::lock_guard<std::mutex> guard(g_log_mutex);
+    if (!log_open_locked()) return;
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(g_log_fp, fmt, args);
+    va_end(args);
+    fputc('\n', g_log_fp);
+#if FORCE_SYNC_WITH_LOG_FILE
+    fflush(g_log_fp);
+#endif
+}
+
+void write_log_n(const char* fmt, ...) {
+    std::lock_guard<std::mutex> guard(g_log_mutex);
+    if (!log_open_locked()) return;
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(g_log_fp, fmt, args);
+    va_end(args);
+#if FORCE_SYNC_WITH_LOG_FILE
+    fflush(g_log_fp);
+#endif
+}
 
 #define CASE(e)                                                                                                        \
     case e:                                                                                                            \
@@ -1103,13 +1165,12 @@ const char* glEnumToString(GLenum e) {
 #if LOG_CALLED_FUNCS
 
 #include "../config/config.h"
-#include <ska/flat_hash_map.hpp>
 
 void log_unique_function(const char* func_name) {
     if (!func_name || strlen(func_name) < 2 || strncmp(func_name, "gl", 2) != 0) {
         return;
     }
-    static ska::flat_hash_set<std::string> logged_functions;
+    static std::unordered_set<std::string> logged_functions;
     static std::mutex log_mutex;
     std::string func_str(func_name);
 

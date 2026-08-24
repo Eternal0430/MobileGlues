@@ -16,6 +16,7 @@
 #include <cstring>
 #include <iostream>
 #include "../../config/settings.h"
+#include <ankerl/unordered_dense.h>
 #include "../drawing.h"
 
 extern "C"

@@ -32,21 +32,77 @@ extern "C"
 
     GLuint find_real_buffer(GLuint key);
 
-    // key is a *_BINDING query enum, the kind glGetIntegerv is given.
     GLuint find_bound_buffer(GLenum key);
-    // target is a bind target, the kind glBindBuffer is given. Not interchangeable
-    // with the above: each rejects the other's enums and returns 0.
-    GLuint find_bound_buffer_by_target(GLenum target);
 
-    // The real/driver name bound to target, as GLES.glGetIntegerv(<target>_BINDING)
-    // would report it -- the two functions above answer with this layer's own
-    // names, which the driver has never heard of. Computed from tracked state, so
-    // it costs nothing and is safe to call per draw, and it is the value to hand
-    // straight back to GLES.glBindBuffer when restoring a temporary bind.
-    //
-    // Only valid where the driver's binding still agrees with the tracked one; the
-    // comment on the definition in gl/buffer.cpp lists where it does not.
-    GLuint mg_driver_bound_buffer(GLenum target);
+    void set_bound_buffer_by_target(GLenum target, GLuint buffer);
+
+    // --- PBO CPU shadow data (for BGRA swizzle without glMapBufferRange read) ---
+    // MobileGL-DirectGLES keeps a CPU shadow copy of every PBO; we adopt the
+    // same design but only for GL_PIXEL_UNPACK_BUFFER. This lets us do CPU-side
+    // BGRA->RGBA swizzle in glTexSubImage2D/glTexImage2D without mapping the
+    // source PBO for reading (which fails on many GLES drivers).
+    void pbo_shadow_alloc(GLuint pbo, GLsizeiptr size, const void* data);
+    void pbo_shadow_subdata(GLuint pbo, GLintptr offset, GLsizeiptr size, const void* data);
+    void pbo_shadow_delete(GLuint pbo);
+    // Returns a pointer to the PBO's CPU shadow data, or nullptr if none.
+    // The pointer is valid until the next PBO operation on this buffer.
+    const unsigned char* pbo_shadow_get(GLuint pbo);
+    // Returns the size of the PBO's CPU shadow data, or 0 if none.
+    GLsizeiptr pbo_shadow_size(GLuint pbo);
+    // Combined lookup: returns {ptr, size} in a single locked lookup.
+    const unsigned char* pbo_shadow_get_ptr_size(GLuint pbo, GLsizeiptr* outSize);
+    // If the PBO is currently write-mapped, returns its shadow base pointer
+    // and the mapped [offset, length) range. Returns false if not mapped.
+    bool pbo_shadow_get_mapped_range(GLuint pbo, const unsigned char** outData,
+                                      GLintptr* outOffset, GLsizeiptr* outLength);
+    // For glMapBufferRange(GL_MAP_WRITE_BIT): returns a writable CPU pointer
+    // into the shadow buffer at `offset`. Caller must call pbo_shadow_unmap
+    // to flush the shadow back to GLES.
+    void* pbo_shadow_map_write(GLuint pbo, GLintptr offset, GLsizeiptr length);
+    void pbo_shadow_unmap(GLuint pbo);
+    // Combined hot-path: ensure the shadow exists (lazily allocating if needed)
+    // and write-map it in a single locked lookup. Replaces the previous 3-lock
+    // sequence (pbo_shadow_get + pbo_shadow_alloc + pbo_shadow_map_write) in
+    // glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, GL_MAP_WRITE_BIT). Reduces
+    // lock-acquisition jitter on contended texture-upload paths, which matters
+    // for frame-time stability under high CPU load.
+    void* pbo_shadow_ensure_and_map_write(GLuint pbo, GLintptr offset, GLsizeiptr length);
+    // Combined hot-path: snapshot the write-mapped range and clear the mapped
+    // flag in a single locked lookup. Replaces the previous 2-lock sequence
+    // (pbo_shadow_get_mapped_range + pbo_shadow_unmap) in
+    // glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER).
+    bool pbo_shadow_unmap_and_get_range(GLuint pbo, const unsigned char** outData,
+                                         GLintptr* outOffset, GLsizeiptr* outLength);
+
+    // --- Thread-local scratch buffer cache ---
+    // Texture-upload swizzle path needs a tight temporary buffer per upload
+    // (size = width*height*depth*4). Repeatedly calling malloc/free on every
+    // glTexSubImage2D is a hot-path bottleneck. This cache keeps a per-thread
+    // growable buffer that is reused across calls - acquires returns {ptr,
+    // capacity}; the caller uses min(requestedSize, capacity) bytes and the
+    // memory is recycled on the next acquire. NOT thread-safe across threads;
+    // each thread gets its own slot.
+    struct MgScratchBuffer {
+        void* ptr = nullptr;
+        size_t capacity = 0;
+    };
+    MgScratchBuffer* mg_acquire_scratch_buffer();
+    // Returns true if `ptr` points into the calling thread's scratch buffer.
+    // Use after swizzle_pixels_for_unpack to skip free() for scratch-owned
+    // memory (the scratch buffer is reused on the next call).
+    inline bool mg_scratch_owns(const void* ptr) {
+        return ptr != nullptr && ptr == mg_acquire_scratch_buffer()->ptr;
+    }
+
+    GLuint find_bound_ssbo_indexed(GLuint index);
+
+    // --- Atomic counter fast-path flag ---
+    // Cached result of (atomicCounterBufferBinding != 0 && !atomicCounterData.empty()).
+    // Set false at init/reset; flipped true only when atomic-counter emulation
+    // is actually in use. Draw/dispatch entry points read this single bool instead
+    // of performing two memory loads + branches per call.
+    extern bool g_atomicCountersActive;
+    void mg_update_atomic_counters_active_flag();
 
     GLuint gen_array();
 

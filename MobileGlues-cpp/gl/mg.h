@@ -1,144 +1,105 @@
 // MobileGlues - gl/mg.h
+// State manager header: backward-compatible wrappers around GLStateManager.
+// All old extern declarations and macros are mapped to GLStateManager methods.
+//
 // Copyright (c) 2025-2026 MobileGL-Dev
 // Licensed under the GNU Lesser General Public License v2.1:
 //   https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
 // SPDX-License-Identifier: LGPL-2.1-only
 // End of Source File Header
 
-#ifndef MOBILEGLUES_MG_H
-#define MOBILEGLUES_MG_H
+#pragma once
 
-typedef unsigned int uint;
-
-#include <cstring>
-#include <cstdlib>
-
-#ifndef __APPLE__
-#include <malloc.h>
-#endif
-
-#ifdef __ANDROID__
-#include <android/log.h>
-#endif
-
-#include <GL/gl.h>
+#include "state.h"
+#include <EGL/egl.h>
 #include "../gles/gles.h"
-#include "log.h"
-#include "../gles/loader.h"
-#include "../includes.h"
-#include "glsl/glsl_for_es.h"
-#include "../config/config.h"
+#include "glext.h"
 
-#ifdef __cplusplus
-extern "C"
-{
-#endif
+// Include the loader handle extern (defined in gles/loader.cpp)
+extern void* g_loader_handle;
 
-#define FUNC_GL_STATE_SIZEI(name)                                                                                      \
-    void set_gl_state_##name(GLsizei value) {                                                                          \
-        gl_state->name = value;                                                                                        \
-        LOG_D(" -> gl_state: %s is %d", #name, value);                                                                 \
+// ============================================================================
+// Backward-compatible #define macros for old code
+// ============================================================================
+// NOTE: Removed legacy aliases that had no remaining callers in the codebase:
+//   current_program, current_tex_unit, is_draw_call, buffer_map*,
+//   vao_map*, texture_map*, fbo_map*, shader_map*, program_map*,
+//   buffer_info, getReal*/getVirtual* inline helpers, FUNC_GL_STATE_* /
+//   GET_GL_STATE_* setter/getter macros. The retained aliases below are
+//   still used by texture.cpp / getter.cpp / ExtWrappers / framebuffer.h.
+
+// Old state variable aliases (pointer-style for backward compat)
+#define gl_state         (&GLState)
+#define hardware         (&GLState)
+#define proxy_width      proxyWidth
+#define proxy_height     proxyHeight
+#define proxy_intformat  proxyInternalFormat
+#define current_draw_fbo GLState.currentDrawFBO
+#define current_read_fbo GLState.framebuffer.readFBO
+
+// Old format conversion aliases (inline functions to avoid macro collisions)
+inline GLenum CheckTextureTarget(GLenum target) { return GLStateManager::ConvertTextureTarget(target); }
+inline GLenum CheckInternalFormat(GLenum format) { return GLStateManager::ConvertInternalFormat(format); }
+inline GLenum CheckFormat(GLenum format) { return GLStateManager::ConvertFormat(format); }
+inline GLenum CheckType(GLenum type) { return GLStateManager::ConvertType(type); }
+inline bool mglIsDepthStencil(GLenum format) { return GLStateManager::IsDepthStencilFormat(format); }
+inline bool mglIsCompressed(GLenum format) { return GLStateManager::IsCompressedFormat(format); }
+inline GLenum TextureBindingTarget(GLenum target) { return GLStateManager::GetTextureBindingTarget(target); }
+inline GLenum targetToBinding(GLenum target) { return GLStateManager::TargetToBindingTarget(target); }
+
+// Old state setter functions (called from texture.cpp, buffer.cpp, etc.)
+inline void set_gl_state_proxy_width(GLsizei value) { GLState.proxyWidth = value; }
+inline void set_gl_state_proxy_height(GLsizei value) { GLState.proxyHeight = value; }
+inline void set_gl_state_proxy_intformat(GLenum value) { GLState.proxyInternalFormat = value; }
+inline void set_gl_state_current_program(GLuint value) { GLState.currentProgram = value; }
+inline void set_gl_state_current_tex_unit(GLuint value) { GLState.currentTexUnit = value; }
+inline void set_gl_state_current_draw_fbo(GLuint value) { GLState.currentDrawFBO = value; }
+
+// Legacy helpers from original mg.cpp (called from texture.cpp)
+inline GLenum pname_convert(GLenum pname) {
+    switch (pname) {
+    case GL_TEXTURE_LOD_BIAS:
+        return GL_TEXTURE_LOD_BIAS_QCOM;
     }
-#define FUNC_GL_STATE_ENUM(name)                                                                                       \
-    void set_gl_state_##name(GLenum value) {                                                                           \
-        gl_state->name = value;                                                                                        \
-        LOG_D(" -> gl_state: %s is %d", #name, value);                                                                 \
-    }
-#define FUNC_GL_STATE_UINT(name)                                                                                       \
-    void set_gl_state_##name(GLuint value) {                                                                           \
-        gl_state->name = value;                                                                                        \
-        LOG_D(" -> gl_state: %s is %d", #name, value);                                                                 \
-    }
-#define FUNC_GL_STATE_SIZEI_DECLARATION(name) void set_gl_state_##name(GLsizei value);
-#define FUNC_GL_STATE_ENUM_DECLARATION(name) void set_gl_state_##name(GLenum value);
-#define FUNC_GL_STATE_UINT_DECLARATION(name) void set_gl_state_##name(GLuint value);
-
-    FUNC_GL_STATE_SIZEI_DECLARATION(proxy_width)
-    FUNC_GL_STATE_SIZEI_DECLARATION(proxy_height)
-    FUNC_GL_STATE_ENUM_DECLARATION(proxy_intformat)
-    FUNC_GL_STATE_UINT_DECLARATION(current_program)
-    FUNC_GL_STATE_UINT_DECLARATION(current_tex_unit)
-    FUNC_GL_STATE_UINT_DECLARATION(current_draw_fbo)
-
-    struct hardware_s {
-        unsigned int es_version;
-        bool emulate_texture_buffer;
-    };
-    typedef struct hardware_s* hardware_t;
-    extern hardware_t hardware;
-
-    struct gl_state_s {
-        GLsizei proxy_width;
-        GLsizei proxy_height;
-        GLenum proxy_intformat;
-
-        GLuint current_program;
-        GLuint current_tex_unit;
-        GLuint current_draw_fbo;
-
-        // The pixel-store parameters desktop GL has and GLES does not.
-        //
-        // GLES answers GL_INVALID_ENUM for all six, in both directions, so before
-        // this they could neither be set nor read: glGetIntegerv left the
-        // application's variable exactly as it found it, which for the usual
-        // stack local is whatever happened to be there. State that cannot be read
-        // back is not state. Kept here so it is per context, like the rest of the
-        // pixel-store block the driver owns.
-        //
-        // Only the two SWAP_BYTES are acted on (gl/transfer.cpp, on the paths that
-        // already repack on the CPU). LSB_FIRST orders bits within a byte for
-        // GL_BITMAP and colour-index transfers, neither of which exists in a core
-        // profile; PACK_IMAGE_HEIGHT and PACK_SKIP_IMAGES describe a
-        // three-dimensional readback this layer does not implement.
-        GLint unpack_swap_bytes;
-        GLint unpack_lsb_first;
-        GLint pack_swap_bytes;
-        GLint pack_lsb_first;
-        GLint pack_image_height;
-        GLint pack_skip_images;
-    };
-    typedef struct gl_state_s* gl_state_t;
-    // Where gl_state points when no tracked context is current. Every member is a
-    // scalar, so this is constant-initialised and is already usable while the
-    // library's own constructors run.
-    extern gl_state_s g_default_gl_state;
-    // thread_local: EGL scopes the current context per thread, so two threads
-    // each holding a context must not share this pointer.
-    //
-    // It is initialised to the fallback rather than left null. Of the per-context
-    // pointers this layer swaps on eglMakeCurrent -- the buffer, texture,
-    // framebuffer and FSR1 ones -- this was the only one that started as a bare
-    // null, and the fallback was only ever installed from inside
-    // mg_context_make_current. A thread whose current context this layer never saw
-    // created therefore reached glUseProgram with a null gl_state and dereferenced
-    // address zero.
-    extern thread_local gl_state_t gl_state;
-
-    // Raise one of this layer's own GL errors, latched until the next glGetError.
-    //
-    // A call this layer rejects by itself -- a readback target it cannot emulate,
-    // a texture name it has no record of, a buffer size that would overflow --
-    // never reaches the driver, so there is no backend error for glGetError to
-    // find. Those paths used to just return, handing the application back an
-    // untouched buffer and GL_NO_ERROR with no way to tell the two apart. This is
-    // where they say what went wrong instead.
-    //
-    // One slot per thread and the first error wins, which is what GL 4.6 sec 2.3.1
-    // asks for. Per thread rather than per context because several of these paths
-    // run with no context current at all.
-    void mg_set_gl_error(GLenum error);
-
-    GLenum pname_convert(GLenum pname);
-    GLenum map_tex_target(GLenum target);
-    void start_log();
-    void write_log(const char* format, ...);
-    void write_log_n(const char* format, ...);
-    void clear_log();
-
-#ifdef __cplusplus
+    return pname;
 }
-#endif
 
-void prepareForDraw();
+inline GLenum map_tex_target(GLenum target) {
+    switch (target) {
+    case GL_TEXTURE_1D:
+    case GL_TEXTURE_RECTANGLE_ARB:
+        return GL_TEXTURE_2D;
+    case GL_PROXY_TEXTURE_1D:
+    case GL_PROXY_TEXTURE_RECTANGLE_ARB:
+        return GL_PROXY_TEXTURE_2D;
+    default:
+        return target;
+    }
+}
 
-#endif // MOBILEGLUES_MG_H
+// Old state setter/getter macros (FUNC_GL_STATE_*, GET_GL_STATE_*) removed:
+// no remaining callers; direct field access is used everywhere instead.
+
+// ============================================================================
+// New: RenderState version accessor (for backend dirty-tracking)
+// ============================================================================
+
+inline uint32_t GetRenderStateVersion() { return GLState.renderState.GetVersion(); }
+inline const RenderStateParameters& GetRenderStateParameters() { return GLState.renderState.GetAllParameters(); }
+
+// ============================================================================
+// New: ErrorState convenience accessors
+// ============================================================================
+
+inline void RecordGLError(ErrorCode code, const char* message) {
+    GLState.errorState.RecordError(code, std::make_unique<GenericErrorInfo>(message));
+}
+
+inline bool HasGLError() { return GLState.errorState.HasGLError(); }
+inline void ClearGLErrors() { GLState.errorState.Clear(); }
+
+// ============================================================================
+// Global texture unit count (queried from GLES)
+// ============================================================================
+
+extern int MG_MAX_COMBINED_TEXTURE_IMAGE_UNITS;

@@ -3441,21 +3441,6 @@ extern "C"
 #define GL_ARB_compute_shader 1
 #endif /* GL_ARB_compute_shader */
 
-#ifndef GL_ARB_compute_variable_group_size
-#define GL_ARB_compute_variable_group_size 1
-#define GL_MAX_COMPUTE_VARIABLE_GROUP_INVOCATIONS_ARB 0x9344
-#define GL_MAX_COMPUTE_FIXED_GROUP_INVOCATIONS_ARB 0x90EB
-#define GL_MAX_COMPUTE_VARIABLE_GROUP_SIZE_ARB 0x9345
-#define GL_MAX_COMPUTE_FIXED_GROUP_SIZE_ARB 0x91BF
-    typedef void(APIENTRYP PFNGLDISPATCHCOMPUTEGROUPSIZEARBPROC)(GLuint num_groups_x, GLuint num_groups_y,
-                                                                 GLuint num_groups_z, GLuint group_size_x,
-                                                                 GLuint group_size_y, GLuint group_size_z);
-#ifdef GL_GLEXT_PROTOTYPES
-    GLAPI void APIENTRY glDispatchComputeGroupSizeARB(GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z,
-                                                      GLuint group_size_x, GLuint group_size_y, GLuint group_size_z);
-#endif
-#endif /* GL_ARB_compute_variable_group_size */
-
 #ifndef GL_ARB_conditional_render_inverted
 #define GL_ARB_conditional_render_inverted 1
 #endif /* GL_ARB_conditional_render_inverted */

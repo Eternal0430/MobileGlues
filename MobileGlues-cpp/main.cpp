@@ -5,12 +5,13 @@
 // SPDX-License-Identifier: LGPL-2.1-only
 // End of Source File Header
 
+#include "config/config.h"
 #include "config/settings.h"
-#include "config/stats.h"
 #include "egl/egl.h"
 #include "egl/loader.h"
 #include "gl/envvars.h"
 #include "gl/gl.h"
+#include "gl/glsl/glsl_for_es.h"
 #include "gl/log.h"
 #include "gl/mg.h"
 #include "gles/loader.h"
@@ -21,17 +22,11 @@
 
 #define DEBUG 0
 
-#ifndef __APPLE__
 __attribute__((used))
-#endif
 const char* license = "GNU LGPL-2.1 License";
 
 void init_config() {
-    if (!check_path()) return;
-    config_refresh();
-    // One dlopen of this library is one launch. Counting it here, before any
-    // rendering work, means a game that crashes on the first frame still counts.
-    bump_launch_count();
+    if (check_path()) config_refresh();
 }
 
 void show_license() {
@@ -71,13 +66,16 @@ void proc_init() {
 
     init_settings_post();
 
+    // Pre-initialize glslang so the one-time symbol-table build does not land
+    // on the first glShaderSource call (which would stack with the first
+    // shader compile and cause a noticeable CPU spike on the first frame).
+    init_glslang_once();
+
 #if PROFILING
     init_perfetto();
 #endif
 
     // Cleanup
-#ifndef __APPLE__
     destroy_temp_egl_ctx();
-#endif
     g_initialized = 1;
 }

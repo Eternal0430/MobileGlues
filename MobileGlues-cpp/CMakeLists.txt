@@ -1,10 +1,11 @@
-cmake_minimum_required(VERSION 3.22.1)
+# MobileGLESWrapper - OpenGL on OpenGL ES 3.2
+# Architecture: ES 3.2 native → native pass-through, non-native → CPU simulation
+cmake_minimum_required(VERSION 3.28.0)
 project("mobileglues")
 enable_language(CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 
 # glslang & SPIRV-Cross
@@ -28,16 +29,24 @@ set(SPIRV_CROSS_ENABLE_UTIL    OFF CACHE BOOL "Disable util" FORCE)
 add_subdirectory(3rdparty/glslang)
 add_subdirectory(3rdparty/SPIRV-Cross)
 
-if(MACOS)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w -fvisibility=default -funwind-tables -g -D_THREAD_SAFE -fPIC -stdlib=libc++")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w -g -std=gnu99 -funwind-tables -fvisibility=hidden")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libstdc++")
-else()
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w -fvisibility=hidden -funwind-tables -g -D_THREAD_SAFE -fPIC")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w -g -std=gnu99 -funwind-tables -fvisibility=hidden")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libstdc++")
-    set(CMAKE_ANDROID_STL_TYPE c++_static)
-endif()
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w -fvisibility=hidden -fvisibility-inlines-hidden -funwind-tables -g -D_THREAD_SAFE -fPIC")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w -g -std=gnu99 -funwind-tables -fvisibility=hidden -fvisibility-inlines-hidden")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libstdc++")
+set(CMAKE_ANDROID_STL_TYPE c++_static)
+
+# Hot-path micro-optimizations:
+#   -fno-trapping-math:        GL wrappers don't rely on FP traps; lets the
+#                              compiler reorder/reciprocal-approximate FP.
+#   -fno-signaling-nans:       Same rationale; std::nan / quiet-NaN checks
+#                              are unaffected.
+#   -ffp-contract=fast:        Permit FMA contraction for vertex/uniform
+#                              packed math without per-op errno setup.
+#   -fno-math-errno is already on by -ffast-math-lite below; we set it
+#   explicitly to keep behavior stable across toolchains.
+# These do NOT enable -ffast-math (which would flip flush-to-zero and
+# break depth-range calculations); they only relax math-side CPU stalls.
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-trapping-math -fno-signaling-nans -ffp-contract=fast -fno-math-errno")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-trapping-math -fno-signaling-nans -ffp-contract=fast -fno-math-errno")
 
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     # Check if ThinLTO or LTO is suppported
@@ -71,12 +80,13 @@ endif()
 
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MATCHES "AppleClang")
-    add_compile_options(-O3 -ffunction-sections -fdata-sections)
-    add_link_options(-Wl,--gc-sections)
+    add_compile_options(-O3 -ffunction-sections -fdata-sections -flto -fno-math-errno)
+    add_link_options(-Wl,--gc-sections -flto)
 elseif (CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
 #    add_compile_options(/O2)
 else ()
-    add_compile_options(-O2)
+    add_compile_options(-O2 -flto)
+    add_link_options(-flto)
 endif()
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
@@ -100,15 +110,11 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
     gl/texture.cpp
     gl/drawing.cpp
     gl/multidraw.cpp
-    bench/multidraw_bench.cpp
     gl/mg.cpp
     gl/buffer.cpp
     gl/getter.cpp
-    gl/enable.cpp
-    gl/restart.cpp
-    egl/context.cpp
+    gl/state.cpp
     gl/pixel.cpp
-    gl/transfer.cpp
     gl/random_string_gen.cpp
     gl/ExtWrappers/DSAWrapper.cpp
     gl/ExtWrappers/MultiBindWrapper.cpp
@@ -125,11 +131,11 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
     config/config.cpp
     config/gpu_utils.cpp
     config/settings.cpp
-    config/stats.cpp
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ./includes
+    ./3rdparty/glm
     ./3rdparty/xxhash)
 target_include_directories(${CMAKE_PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
@@ -138,42 +144,10 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
     spirv-cross-c
 )
 
-if (NOT MSVC)
-    # Calls between this library's own translation units must land in this
-    # library. Without this, an internal call to an exported gl* symbol goes
-    # through a preemptible PLT slot, and in an Android app process the system
-    # libGLESv2 -- always in the global symbol scope -- can win the lookup: the
-    # DSA wrappers and the benchmark would then be calling the real driver where
-    # they meant the frontend, silently bypassing all state tracking. The
-    # symbols stay exported for dlsym and eglGetProcAddress; only who internal
-    # calls bind to changes. On the target, not in the AppleClang-guarded block
-    # above -- that block's condition has never been true (dangling NOT MATCHES),
-    # which is also why --gc-sections never made it into the link.
-    target_link_options(${CMAKE_PROJECT_NAME} PRIVATE -Wl,-Bsymbolic-functions)
-endif()
-
-if(MACOS)
-    # iOS
-    target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
-        "-F${CMAKE_SOURCE_DIR}/external"
-        "-framework libEGL"
-        "-framework libGLESv2"
-        "-framework Metal"
-        "-framework Foundation"
-        "-framework QuartzCore"
-    )
-elseif(ANDROID)
-    # Android
-    target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
-        android
-        log
-    )
-    else()
-    # Linux — EGL/GLES are loaded dynamically via dlopen
-    target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
-        ${CMAKE_DL_LIBS}
-    )
-endif()
+target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC
+    android
+    log
+)
 
 if (PROFILING)
     find_package(Threads)

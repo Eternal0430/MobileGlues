@@ -5,21 +5,15 @@
 // SPDX-License-Identifier: LGPL-2.1-only
 // End of Source File Header
 
+// ============================================================================
+// Vertex Attribute Architecture
+//
+// Principle: "ES 3.2 native → native, ES 3.2 not native → CPU simulation"
+//
+// ES 3.2 natively supports:
+//   - glVertexAttribI4ui, glVertexAttribI4i (integer vertex attributes with 4 components)
+// ============================================================================
+
 #include "vertexattrib.h"
 
 #define DEBUG 0
-
-void glVertexAttribI1ui(GLuint index, GLuint x) {
-    LOG()
-    GLES.glVertexAttribI4ui(index, x, 0, 0, 0);
-}
-
-void glVertexAttribI2ui(GLuint index, GLuint x, GLuint y) {
-    LOG()
-    GLES.glVertexAttribI4ui(index, x, y, 0, 0);
-}
-
-void glVertexAttribI3ui(GLuint index, GLuint x, GLuint y, GLuint z) {
-    LOG()
-    GLES.glVertexAttribI4ui(index, x, y, z, 0);
-}

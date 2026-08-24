@@ -22,6 +22,13 @@ extern "C"
 
     const char* glEnumToString(GLenum e);
 
+    // Log file functions (used by LOG_* macros). Implemented in log.cpp;
+    // they write to log_file_path (e.g. /sdcard/MG/latest.log).
+    void write_log(const char* fmt, ...);
+    void write_log_n(const char* fmt, ...);
+    void clear_log();
+    void start_log();
+
 #ifdef __cplusplus
 }
 #endif
@@ -100,7 +107,7 @@ void log_unique_function(const char* func_name);
         write_log(__VA_ARGS__);                                                                                        \
     }
 #define LOG_E(...)                                                                                                     \
-    if (DEBUG || GLOBAL_DEBUG) {                                                                                       \
+    {                                                                                                                  \
         __android_log_print(ANDROID_LOG_ERROR, RENDERERNAME, __VA_ARGS__);                                             \
         printf(__VA_ARGS__);                                                                                           \
         printf("\n");                                                                                                  \

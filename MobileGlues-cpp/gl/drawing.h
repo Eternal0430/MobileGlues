@@ -5,6 +5,17 @@
 // SPDX-License-Identifier: LGPL-2.1-only
 // End of Source File Header
 
+// ============================================================================
+// Drawing Module Header (OpenGL ES 3.2)
+//
+// Architecture rule: "ES 3.2 native → native, ES 3.2 not native → CPU simulation"
+//
+// Native draw calls (ES 3.2 directly supports):
+//   glDrawElements, glDrawElementsInstanced, glDrawElementsBaseVertex
+//   glDrawArrays, glDrawArraysInstanced, glDrawRangeElements
+//   glDrawArraysIndirect, glDrawElementsIndirect, glClear
+// ============================================================================
+
 #ifndef MOBILEGLUES_DRAWING_H
 #define MOBILEGLUES_DRAWING_H
 
@@ -20,6 +31,7 @@
 #include "log.h"
 #include "../gles/loader.h"
 #include "mg.h"
+#include "state.h"  // for MAX_TEXTURE_UNITS
 
 struct SamplerInfo {
     GLint locWidth;
@@ -27,39 +39,43 @@ struct SamplerInfo {
     std::vector<GLint> samplers;
 };
 
+// Texture binding tracking per unit to avoid glGetIntegerv GPU queries.
+// Updated by glBindTexture (texture.cpp), read by setupBufferTextureUniforms (drawing.cpp).
+// Use MAX_TEXTURE_UNITS from state.h for consistency.
+extern GLuint g_tracked_tex2d_binding[MAX_TEXTURE_UNITS];
+extern GLuint g_tracked_tex_cube_binding[MAX_TEXTURE_UNITS];
+extern GLuint g_tracked_tex_2d_array_binding[MAX_TEXTURE_UNITS];
+extern GLuint g_tracked_tex_3d_binding[MAX_TEXTURE_UNITS];
+extern GLuint g_tracked_tex_2d_ms_binding[MAX_TEXTURE_UNITS];
+extern GLuint g_tracked_tex_2d_ms_array_binding[MAX_TEXTURE_UNITS];
+extern GLuint g_tracked_tex_cube_array_binding[MAX_TEXTURE_UNITS];
+extern GLuint g_tracked_tex_rect_binding[MAX_TEXTURE_UNITS];
+
 #ifdef __cplusplus
 extern "C"
 {
 #endif
 
+    // ============================================================================
+    // Native draw calls (ES 3.2)
+    // ============================================================================
+
+    GLAPI GLAPIENTRY void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices);
     GLAPI GLAPIENTRY void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices,
                                                   GLsizei primcount);
     GLAPI GLAPIENTRY void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const void* indices,
                                                    GLint basevertex);
-    GLAPI GLAPIENTRY void glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type,
-                                              const void* const* indices, GLsizei primcount);
-    GLAPI GLAPIENTRY void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices);
-
-    // The rest of the indexed family, so GL_PRIMITIVE_RESTART is applied to all
-    // of it rather than only to the three above.
+    GLAPI GLAPIENTRY void glDrawArrays(GLenum mode, GLint first, GLsizei count);
+    GLAPI GLAPIENTRY void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount);
     GLAPI GLAPIENTRY void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type,
                                               const void* indices);
-    GLAPI GLAPIENTRY void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count,
-                                                        GLenum type, const void* indices, GLint basevertex);
-    GLAPI GLAPIENTRY void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type,
-                                                            const void* indices, GLsizei instancecount,
-                                                            GLint basevertex);
+    GLAPI GLAPIENTRY void glDrawArraysIndirect(GLenum mode, const void* indirect);
+    GLAPI GLAPIENTRY void glDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect);
+    GLAPI GLAPIENTRY void glClear(GLbitfield mask);
 
-    // GL 4.2 base instance. GLES has none, so these forward and report a
-    // non-zero base instance once; they used to be stubs that drew nothing.
-    GLAPI GLAPIENTRY void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count,
-                                                            GLsizei instancecount, GLuint baseinstance);
-    GLAPI GLAPIENTRY void glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type,
-                                                              const void* indices, GLsizei instancecount,
-                                                              GLuint baseinstance);
-    GLAPI GLAPIENTRY void glDrawElementsInstancedBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum type,
-                                                                        const void* indices, GLsizei instancecount,
-                                                                        GLint basevertex, GLuint baseinstance);
+    // ============================================================================
+    // Other functions (keep existing logic)
+    // ============================================================================
 
     GLAPI GLAPIENTRY void glBindImageTexture(GLuint unit, GLuint texture, GLint level, GLboolean layered, GLint layer,
                                              GLenum access, GLenum format);
