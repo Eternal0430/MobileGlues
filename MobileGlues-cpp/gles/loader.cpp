@@ -115,6 +115,9 @@ void* proc_address(void* lib, const char* name) {
 void set_hardware() {
     // ES 3.2-only: always set version to 320 — no per-version branching needed.
     GLState.esVersion = 320;
+    // Log the driver's GLES version string into the log file (latest.log),
+    // matching upstream's startup renderer info output.
+    set_es_version();
 }
 
 void init_gl_state() {
@@ -249,6 +252,11 @@ void InitGLESCapabilities() {
     }
 
     LOG_I("%sDetected GL_EXT_multi_draw_indirect!", g_gles_caps.GL_EXT_multi_draw_indirect ? "" : "Not ")
+    LOG_I("Enable-capability extensions: multisample_compatibility=%d clip_cull_distance=%d depth_clamp=%d "
+          "sRGB_write_control=%d NV_polygon_mode=%d OES_sample_shading=%d",
+          g_gles_caps.GL_EXT_multisample_compatibility, g_gles_caps.GL_EXT_clip_cull_distance,
+          g_gles_caps.GL_EXT_depth_clamp, g_gles_caps.GL_EXT_sRGB_write_control, g_gles_caps.GL_NV_polygon_mode,
+          g_gles_caps.GL_OES_sample_shading)
     LOG_I("%sDetected GL_EXT_color_buffer_float!", g_gles_caps.GL_EXT_color_buffer_float ? "" : "Not ")
     LOG_I("%sDetected GL_EXT_color_buffer_half_float!", g_gles_caps.GL_EXT_color_buffer_half_float ? "" : "Not ")
     LOG_I("%sDetected GL_EXT_texture_norm16!", g_gles_caps.GL_EXT_texture_norm16 ? "" : "Not ")
