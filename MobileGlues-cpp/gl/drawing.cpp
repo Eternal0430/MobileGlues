@@ -20,6 +20,12 @@
 
 #define DEBUG 0
 
+// Called by gl/multidraw.cpp before issuing draw calls. The upstream refactor
+// uses this hook to push buffer-texture uniforms for its texture-buffer
+// emulation; this fork does not emulate texture buffers on the multidraw path,
+// so the hook is a no-op. Kept as a named symbol so multidraw.cpp links.
+void prepareForDraw() {}
+
 // ---------------------------------------------------------------------------
 // Module-level state: tracked texture bindings per unit
 // (referenced from texture.cpp and drawing.cpp)

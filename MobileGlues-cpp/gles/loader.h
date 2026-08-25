@@ -156,6 +156,7 @@ extern "C"
         [[maybe_unused]] int GL_EXT_read_format_bgra;
         int GL_OES_mapbuffer;
         int GL_EXT_multi_draw_indirect;
+        int GL_OES_draw_elements_base_vertex;
         int GL_OES_depth_texture;
         int GL_OES_depth24;
         int GL_OES_depth_texture_float;
@@ -164,6 +165,18 @@ extern "C"
         int EXT_texture_query_lod;
         int KHR_texture_compression_astc_ldr;
         int EXT_texture_filter_anisotropic;
+        // Needed by the virtual enable table (gl/enable.cpp) and the multidraw
+        // backend selection (config/settings.cpp): each of these supplies a
+        // capability GLES 3.2 core does not have. Without them the layer cannot
+        // tell "the driver really supports this" from "the driver will reject
+        // it", and glEnable / backend probing behave differently per device.
+        int GL_EXT_draw_elements_base_vertex;
+        int GL_EXT_multisample_compatibility; // GL_MULTISAMPLE, GL_SAMPLE_ALPHA_TO_ONE
+        int GL_EXT_clip_cull_distance;       // GL_CLIP_DISTANCE0..7
+        int GL_EXT_depth_clamp;              // GL_DEPTH_CLAMP
+        int GL_EXT_sRGB_write_control;       // GL_FRAMEBUFFER_SRGB
+        int GL_NV_polygon_mode;              // GL_POLYGON_OFFSET_LINE / _POINT
+        int GL_OES_sample_shading;           // GL_SAMPLE_SHADING before ES 3.2
         // Float color buffer support. Required by GLES drivers to allow
         // float/half-float internalformats (RGBA16F, RGBA32F,
         // R11F_G11F_B10F, etc.) as color-renderable FBO attachments.

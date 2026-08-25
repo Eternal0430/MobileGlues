@@ -26,8 +26,61 @@
 #include "pixel.h"
 #include "log.h"
 #include "mg.h"
+#include "../egl/context.h"
 
 #define DEBUG 0
+
+// ============================================================================
+// Section: Desktop-only pixel-store parameters (ported from upstream)
+//
+// GLES 3.2 rejects all six of these pnames in both directions, so they are
+// answered from the per-context gl_state_s mirror instead of the driver.
+// ============================================================================
+
+namespace {
+
+GLint* desktop_pixel_store_slot(GLenum pname) {
+    MGContext* ctx = g_current_ctx;
+    if (ctx == nullptr) return nullptr;
+    switch (pname) {
+    case GL_UNPACK_SWAP_BYTES: return &ctx->gl.unpack_swap_bytes;
+    case GL_UNPACK_LSB_FIRST: return &ctx->gl.unpack_lsb_first;
+    case GL_PACK_SWAP_BYTES: return &ctx->gl.pack_swap_bytes;
+    case GL_PACK_LSB_FIRST: return &ctx->gl.pack_lsb_first;
+    case GL_PACK_IMAGE_HEIGHT: return &ctx->gl.pack_image_height;
+    case GL_PACK_SKIP_IMAGES: return &ctx->gl.pack_skip_images;
+    default: return nullptr;
+    }
+}
+
+} // namespace
+
+bool mg_pixel_store_set(GLenum pname, GLint param) {
+    GLint* slot = desktop_pixel_store_slot(pname);
+    if (slot == nullptr) return false;
+    // The booleans store as 0 or 1, the two counts as themselves. GL rejects a
+    // negative count; this layer cannot raise GL_INVALID_VALUE on its own (the
+    // error queue belongs to the driver), so a negative value is simply
+    // refused instead of recorded.
+    switch (pname) {
+    case GL_PACK_IMAGE_HEIGHT:
+    case GL_PACK_SKIP_IMAGES:
+        if (param < 0) return true;
+        *slot = param;
+        break;
+    default:
+        *slot = param != 0 ? 1 : 0;
+        break;
+    }
+    return true;
+}
+
+bool mg_pixel_store_query_int(GLenum pname, GLint* out) {
+    const GLint* slot = desktop_pixel_store_slot(pname);
+    if (slot == nullptr) return false;
+    if (out != nullptr) *out = *slot;
+    return true;
+}
 
 // ============================================================================
 // Section: Type Size Query

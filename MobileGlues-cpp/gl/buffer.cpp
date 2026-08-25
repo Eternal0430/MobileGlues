@@ -434,6 +434,12 @@ static GLenum get_binding_query(GLenum target) {
     }
 }
 
+GLuint mg_driver_bound_buffer(GLenum target) {
+    GLenum b = get_binding_query(target);
+    GLuint n = find_bound_buffer(b);
+    return (n == 0 || !has_buffer(n)) ? n : find_real_buffer(n);
+}
+
 // ============================================================================
 // Vertex Array Map Helpers
 // ============================================================================

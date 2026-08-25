@@ -335,29 +335,9 @@ static bool       g_scissorInit = false;
 static GLboolean  g_colorMask[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
 static bool       g_colorMaskInit = false;
 
-extern "C" GLAPI GLAPIENTRY void glEnableARB(GLenum cap) __attribute__((alias("glEnable")));
-extern "C" GLAPI GLAPIENTRY void glEnable(GLenum cap) {
-    auto& s = g_cap_state[cap];
-    if (s == 1) [[likely]] return;
-    s = 1;
-    GLES.glEnable(cap);
-}
-extern "C" GLAPI GLAPIENTRY void glDisableARB(GLenum cap) __attribute__((alias("glDisable")));
-extern "C" GLAPI GLAPIENTRY void glDisable(GLenum cap) {
-    auto& s = g_cap_state[cap];
-    if (s == 2) [[likely]] return;
-    s = 2;
-    GLES.glDisable(cap);
-}
-NATIVE_FUNCTION_HEAD(void, glEnablei, GLenum target, GLuint index) NATIVE_FUNCTION_END_NO_RETURN(void, glEnablei, target,index)
-NATIVE_FUNCTION_HEAD(void, glDisablei, GLenum target, GLuint index) NATIVE_FUNCTION_END_NO_RETURN(void, glDisablei, target,index)
-NATIVE_FUNCTION_HEAD(GLboolean, glIsEnabled, GLenum cap) NATIVE_FUNCTION_END(GLboolean, glIsEnabled, cap)
-NATIVE_FUNCTION_HEAD(GLboolean, glIsEnabledi, GLenum target, GLuint index) NATIVE_FUNCTION_END(GLboolean, glIsEnabledi, target,index)
-// glGetError is handled in getter.cpp (always returns GL_NO_ERROR)
-// glGetIntegerv is handled in getter.cpp (custom getter)
-NATIVE_FUNCTION_HEAD(void, glGetBooleanv, GLenum pname, GLboolean *data) NATIVE_FUNCTION_END_NO_RETURN(void, glGetBooleanv, pname,data)
-NATIVE_FUNCTION_HEAD(void, glGetFloatv, GLenum pname, GLfloat *data) NATIVE_FUNCTION_END_NO_RETURN(void, glGetFloatv, pname,data)
-NATIVE_FUNCTION_HEAD(void, glGetInteger64v, GLenum pname, GLint64 *data) NATIVE_FUNCTION_END_NO_RETURN(void, glGetInteger64v, pname,data)
+// glEnable/glDisable/glEnablei/glDisablei/glIsEnabled/glIsEnabledi and the
+// glGet{Boolean,Float,Integer64}v getters moved to gl/enable.cpp (virtual
+// enable state table); the old redundant-state-skip versions here are retired.
 NATIVE_FUNCTION_HEAD(void, glGetIntegeri_v, GLenum target, GLuint index, GLint *data) NATIVE_FUNCTION_END_NO_RETURN(void, glGetIntegeri_v, target,index,data)
 NATIVE_FUNCTION_HEAD(void, glGetInteger64i_v, GLenum target, GLuint index, GLint64 *data) NATIVE_FUNCTION_END_NO_RETURN(void, glGetInteger64i_v, target,index,data)
 NATIVE_FUNCTION_HEAD(void, glGetBooleani_v, GLenum target, GLuint index, GLboolean *data) NATIVE_FUNCTION_END_NO_RETURN(void, glGetBooleani_v, target,index,data)
