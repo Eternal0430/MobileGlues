@@ -18,6 +18,7 @@
 #include <random>
 #include "log.h"
 #include "random_string_gen.h"
+#include "../egl/loader.h"
 
 #define DEBUG 0
 
@@ -317,6 +318,92 @@ void AppendExtension(const char* ext) {
 }
 
 // =============================================================================
+// Section: Host String Query Safety Helpers
+//
+//   A host GLES driver is allowed to return NULL from glGetString(): the ES 3.2
+//   reference page states "If an error is generated, glGetString returns 0",
+//   and in practice drivers (Adreno, Mali, Mesa, ANGLE) do exactly that when the
+//   calling thread has no current EGL context. Passing such a pointer into
+//   std::string(const char*) is undefined behaviour and crashes inside strlen()
+//   — which is precisely the reported SIGSEGV (si_addr = 0x0, R0 = 0x0) when
+//   Minecraft's renderpearl GlDevice queried GL_RENDERER.
+//
+//   Every host string query therefore goes through these helpers, which:
+//     * bind MobileGLES' fallback pbuffer context if this thread has none
+//     * check the returned pointer before any strlen()/std::string construction
+//     * always hand back a non-NULL string
+// =============================================================================
+
+namespace {
+
+// Binds the fallback context for the duration of a query, but only when the
+// calling thread has no current context of its own.
+class ScopedHostContext {
+public:
+    ScopedHostContext() : bound_(BindFallbackEGLContextIfNeeded()) {}
+    ~ScopedHostContext() {
+        if (bound_) UnbindFallbackEGLContext();
+    }
+    ScopedHostContext(const ScopedHostContext&) = delete;
+    ScopedHostContext& operator=(const ScopedHostContext&) = delete;
+    bool Bound() const { return bound_; }
+
+private:
+    bool bound_;
+};
+
+// Asks the host driver for a string. The first attempt is made as-is, so the
+// common path costs nothing; only if that yields nothing do we bind the
+// fallback context and retry — a missing current context on this thread is the
+// usual reason drivers hand back NULL here.
+const GLubyte* QueryHostString(GLenum name) {
+    if (!GLES.glGetString) return nullptr;
+
+    const GLubyte* str = GLES.glGetString(name);
+    if (str && *str) return str;
+
+    ScopedHostContext scoped;
+    if (scoped.Bound()) {
+        const GLubyte* retry = GLES.glGetString(name);
+        if (retry && *retry) {
+            LOG_W_FORCE("Host glGetString(0x%x) only answered after binding the fallback context: "
+                        "the calling thread had no current EGL context",
+                        name);
+            return retry;
+        }
+    }
+
+    return (str && *str) ? str : nullptr;
+}
+
+// Queries a host GL string, substituting `fallback` when the driver gives
+// nothing usable back.
+std::string SafeHostString(GLenum name, const char* fallback) {
+    const GLubyte* str = QueryHostString(name);
+    if (str) return std::string(reinterpret_cast<const char*>(str));
+
+    LOG_W_FORCE("Host glGetString(0x%x) gave no usable string (NULL returned or symbol unavailable), "
+                "using fallback \"%s\"",
+                name, fallback);
+    return std::string(fallback);
+}
+
+// Raw-pointer variant for queries we forward straight to the caller. Never
+// returns NULL: an empty static string is used instead, so that LWJGL (and
+// anything else doing strlen() on the result) cannot dereference NULL.
+const GLubyte* SafeHostStringRaw(GLenum name) {
+    const GLubyte* str = QueryHostString(name);
+    if (str) return str;
+
+    LOG_W_FORCE("Host glGetString(0x%x) gave no usable string (NULL returned or symbol unavailable); "
+                "returning an empty string instead",
+                name);
+    return reinterpret_cast<const GLubyte*>("");
+}
+
+} // namespace
+
+// =============================================================================
 // Section: GPU Name Helpers
 // =============================================================================
 
@@ -337,7 +424,10 @@ static std::string getBeforeThirdSpace(const std::string& str) {
 }
 
 static std::string getGpuName() {
-    std::string gpuName = std::string((char*)GLES.glGetString(GL_RENDERER));
+    // SafeHostString() guards against a NULL/empty host string: constructing a
+    // std::string straight from the host pointer crashes in strlen() when the
+    // driver returns NULL (no current context on the calling thread).
+    std::string gpuName = SafeHostString(GL_RENDERER, "Unknown GPU");
 
     if (gpuName.empty()) {
         return "<unknown>";
@@ -370,11 +460,11 @@ static std::string getGpuName() {
 }
 
 static std::string getGLESName() {
-    return getBeforeThirdSpace(std::string((char*)GLES.glGetString(GL_VERSION)));
+    return getBeforeThirdSpace(SafeHostString(GL_VERSION, "OpenGL ES 3.2"));
 }
 
 void set_es_version() {
-    std::string ESVersionStr = getBeforeThirdSpace(std::string((const char*)GLES.glGetString(GL_VERSION)));
+    std::string ESVersionStr = getBeforeThirdSpace(SafeHostString(GL_VERSION, "OpenGL ES 3.2"));
     hardware->es_version = 320;
     LOG_I("OpenGL ES Version: %s (%d)", ESVersionStr.c_str(), hardware->es_version)
 }
@@ -553,7 +643,7 @@ const GLubyte* glGetString(GLenum name) {
     // -------------------------------------------------------------------------
     case GL_SETTINGS_MG: {
         if (global_settings.hide_mg_env_level >= HideMGEnvLevel::Level1)
-            return GLES.glGetString(name);
+            return SafeHostStringRaw(name);
 
         static char* settings_string = nullptr;
         std::string tmp = dump_settings_string("  ");
@@ -570,15 +660,15 @@ const GLubyte* glGetString(GLenum name) {
     case GL_EXTENSIONS + GL_BACKEND_GETTER_MG:
     case GL_SHADING_LANGUAGE_VERSION + GL_BACKEND_GETTER_MG:
         if (global_settings.hide_mg_env_level == HideMGEnvLevel::Disabled)
-            return GLES.glGetString(name - GL_BACKEND_GETTER_MG);
+            return SafeHostStringRaw(name - GL_BACKEND_GETTER_MG);
         else
-            return GLES.glGetString(name);
+            return SafeHostStringRaw(name);
 
     // -------------------------------------------------------------------------
     // All other string queries → forward to native GLES
     // -------------------------------------------------------------------------
     default:
-        return GLES.glGetString(name);
+        return SafeHostStringRaw(name);
     }
 }
 

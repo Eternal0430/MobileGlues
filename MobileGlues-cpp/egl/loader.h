@@ -164,6 +164,24 @@ extern "C"
     void init_target_egl();
     void destroy_temp_egl_ctx();
 
+    // -------------------------------------------------------------------------
+    // Fallback context for host string queries
+    //
+    // The pbuffer context created by init_target_egl() used to be destroyed
+    // right after initialization. It is now kept alive instead, because host
+    // GLES string queries (glGetString) return NULL when the calling thread has
+    // no current EGL context — which is legal per the ES 3.2 spec ("If an error
+    // is generated, glGetString returns 0") and used to crash MobileGlues in
+    // strlen(NULL) when a game queried GL_RENDERER from a thread that had not
+    // called eglMakeCurrent yet.
+    //
+    // BindFallbackEGLContextIfNeeded() binds that context on the calling thread
+    // only if the thread has no current context. It returns true when the
+    // caller must later call UnbindFallbackEGLContext().
+    // -------------------------------------------------------------------------
+    bool BindFallbackEGLContextIfNeeded();
+    void UnbindFallbackEGLContext();
+
 #ifdef __cplusplus
 }
 #endif

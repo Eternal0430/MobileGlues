@@ -20,6 +20,11 @@ static EGLDisplay eglDisplay = EGL_NO_DISPLAY;
 static EGLSurface eglSurface = EGL_NO_SURFACE;
 static EGLContext eglContext = EGL_NO_CONTEXT;
 
+// Set once init_target_egl() succeeds. The context is intentionally kept alive
+// (see the note in loader.h) so that host GLES queries can be answered on
+// threads that have no current context of their own.
+static bool g_fallback_context_ready = false;
+
 void init_target_egl() {
     LOAD_EGL(eglGetProcAddress);
     LOAD_EGL(eglBindAPI);
@@ -109,6 +114,7 @@ void init_target_egl() {
     }
 
     LOG_V("EGL initialized successfully");
+    g_fallback_context_ready = true;
     return;
 
 cleanup:
@@ -125,14 +131,43 @@ cleanup:
 }
 
 void destroy_temp_egl_ctx() {
-    LOAD_EGL(eglDestroySurface);
-    LOAD_EGL(eglDestroyContext);
     LOAD_EGL(eglMakeCurrent);
-    LOAD_EGL(eglTerminate);
 
-    egl_eglMakeCurrent(eglDisplay, 0, 0, EGL_NO_CONTEXT);
-    egl_eglDestroySurface(eglDisplay, eglSurface);
-    egl_eglDestroyContext(eglDisplay, eglContext);
+    // Only unbind the context from this thread. The display/context/surface
+    // objects themselves are kept alive: they serve as the fallback context for
+    // host GLES string queries issued from threads without a current context
+    // (see BindFallbackEGLContextIfNeeded below).
+    egl_eglMakeCurrent(eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+}
 
-    egl_eglTerminate(eglDisplay);
+bool BindFallbackEGLContextIfNeeded() {
+    if (!g_fallback_context_ready) return false;
+
+    LOAD_EGL(eglGetCurrentContext);
+    LOAD_EGL(eglMakeCurrent);
+    LOAD_EGL(eglGetError);
+
+    if (egl_eglGetCurrentContext() != EGL_NO_CONTEXT) return false;
+
+    if (egl_eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext) != EGL_TRUE) {
+        LOG_W_FORCE("BindFallbackEGLContext: eglMakeCurrent failed (0x%x)", egl_eglGetError());
+        return false;
+    }
+
+    LOG_W_FORCE("BindFallbackEGLContext: thread had no current EGL context, "
+                "bound MobileGLES fallback pbuffer context for a host query");
+    return true;
+}
+
+void UnbindFallbackEGLContext() {
+    if (!g_fallback_context_ready) return;
+
+    LOAD_EGL(eglGetCurrentContext);
+    LOAD_EGL(eglMakeCurrent);
+
+    // Only release it if it is still the one we bound — never yank a context
+    // that the caller has since replaced with its own.
+    if (egl_eglGetCurrentContext() != eglContext) return;
+
+    egl_eglMakeCurrent(eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 }
