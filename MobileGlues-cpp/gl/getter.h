@@ -33,6 +33,11 @@ extern "C"
     void InitGLESBaseExtensions();
     void set_es_version();
 
+    // Repair a device-limit query the host GLES driver did not answer.
+    // See "Host Limit Query Fallbacks" in getter.cpp for why this exists.
+    void mg_guard_host_limit_i(GLenum pname, GLint* params);
+    void mg_guard_host_limit_i64(GLenum pname, GLint64* params);
+
 #ifdef __cplusplus
 }
 #endif

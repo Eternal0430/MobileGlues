@@ -7,6 +7,7 @@
 
 #include "enable.h"
 #include "pixel.h"
+#include "getter.h"
 #include "../gles/loader.h"
 #include "log.h"
 #include "mg.h"
@@ -634,7 +635,9 @@ extern "C"
             *data = ival;
             return;
         }
-        GLES.glGetInteger64v(pname, data);
+        *data = 0;
+        if (GLES.glGetInteger64v) GLES.glGetInteger64v(pname, data);
+        mg_guard_host_limit_i64(pname, data);
     }
 
     // How many values glGetFloatv writes for a pname. Anything not listed writes

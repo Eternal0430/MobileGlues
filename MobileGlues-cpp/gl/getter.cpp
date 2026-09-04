@@ -16,17 +16,275 @@
 #include <format>
 #include <vector>
 #include <random>
+#include <mutex>
 #include "log.h"
 #include "random_string_gen.h"
 #include "../egl/loader.h"
 
 #define DEBUG 0
 
+// Binds MobileGLES' fallback pbuffer context for the duration of a host query,
+// but only when the calling thread has no current EGL context of its own.
+// Host drivers leave results untouched when there is no current context, which
+// is how both a NULL glGetString and a zeroed glGetIntegerv reach the app.
+class ScopedHostContext {
+public:
+    ScopedHostContext() : bound_(BindFallbackEGLContextIfNeeded()) {}
+    ~ScopedHostContext() {
+        if (bound_) UnbindFallbackEGLContext();
+    }
+    ScopedHostContext(const ScopedHostContext&) = delete;
+    ScopedHostContext& operator=(const ScopedHostContext&) = delete;
+    bool Bound() const { return bound_; }
+
+private:
+    bool bound_;
+};
+
 // =============================================================================
 // Section: Global State
 // =============================================================================
 
 Version GLVersion;
+
+// =============================================================================
+// Section: Host Limit Query Fallbacks
+//
+//   Minecraft 26.3's renderer sizes its dynamic GPU buffers with
+//   Mth.roundToward(capacity, alignment), which is positiveCeilDiv(cap, align)
+//   * align. If a device-limit query yields 0, that becomes Math.floorDiv(x, 0)
+//   and the game dies with "ArithmeticException: / by zero" during
+//   RenderSystem.initRenderer.
+//
+//   A host driver legitimately leaves params untouched when it does not know
+//   the enum (GL_INVALID_ENUM, command ignored) or when the calling thread has
+//   no current EGL context. The application's buffer is then still zero — it
+//   never sees an error, just a nonsense limit.
+//
+//   The guards below catch that at the boundary: retry under MobileGLES'
+//   fallback context if this thread had none, and otherwise substitute a safe
+//   value. Every repair is written to the log so the offending enum is
+//   identifiable from latest.log.
+// =============================================================================
+
+namespace limitguard {
+
+// One entry per limit we are willing to synthesize. `substitute` is a query
+// GLES 3.2 always supports, tried before the hard-coded number — so the value
+// still reflects the real GPU when only the fancy enum is missing.
+// The numbers are conservative order-of-magnitude values for ES 3.2 class
+// hardware, not guaranteed spec minima.
+struct LimitFallback {
+    GLenum pname;
+    const char* name;
+    GLenum substitute; // 0 = none
+    GLint fallback;
+};
+
+// Notes on the values: anything in the ES 3.2 core set uses that spec's
+// mandated minimum, so a substitute can never claim more than the host is
+// guaranteed to deliver. The desktop-only limits use conservative values that
+// are typical rather than maximal — they only have to be plausible, since the
+// real number is used whenever the host answers at all.
+const LimitFallback kLimitFallbacks[] = {
+    // --- Buffer offset alignment. Minecraft 26.3 feeds minUniformOffsetAlignment
+    // --- straight into Mth.roundToward(), so a 0 here is a hard crash.
+    {GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, "GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT", 0, 256},
+    {GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, "GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT",
+     GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, 256},
+    {GL_TEXTURE_BUFFER_OFFSET_ALIGNMENT, "GL_TEXTURE_BUFFER_OFFSET_ALIGNMENT", GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, 256},
+
+    // --- Sizes and binding counts (ES 3.2 mandated minima unless noted).
+    {GL_MAX_UNIFORM_BLOCK_SIZE, "GL_MAX_UNIFORM_BLOCK_SIZE", 0, 16384},
+    {GL_MAX_SHADER_STORAGE_BLOCK_SIZE, "GL_MAX_SHADER_STORAGE_BLOCK_SIZE", GL_MAX_UNIFORM_BLOCK_SIZE, 16777216},
+    {GL_MAX_TEXTURE_BUFFER_SIZE, "GL_MAX_TEXTURE_BUFFER_SIZE", 0, 65536},
+    {GL_MAX_UNIFORM_BUFFER_BINDINGS, "GL_MAX_UNIFORM_BUFFER_BINDINGS", 0, 24},
+    {GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, "GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS", GL_MAX_UNIFORM_BUFFER_BINDINGS,
+     8},
+
+    // --- Limits MobileGlues caches. These are queried once at start-up and the
+    // --- result was kept forever, so a query that happened to run without a
+    // --- current context used to poison them with 0 for the whole session.
+    {GL_MAX_VERTEX_ATTRIBS, "GL_MAX_VERTEX_ATTRIBS", 0, 16},
+    {GL_MAX_DRAW_BUFFERS, "GL_MAX_DRAW_BUFFERS", 0, 8},
+    {GL_MAX_SAMPLES, "GL_MAX_SAMPLES", 0, 4},
+    {GL_MAX_TEXTURE_IMAGE_UNITS, "GL_MAX_TEXTURE_IMAGE_UNITS", 0, 16},
+    {GL_MAX_VERTEX_UNIFORM_VECTORS, "GL_MAX_VERTEX_UNIFORM_VECTORS", 0, 256},
+    {GL_MAX_FRAGMENT_UNIFORM_VECTORS, "GL_MAX_FRAGMENT_UNIFORM_VECTORS", 0, 224},
+    {GL_MAX_VARYING_VECTORS, "GL_MAX_VARYING_VECTORS", 0, 15},
+    {GL_MAX_TEXTURE_SIZE, "GL_MAX_TEXTURE_SIZE", 0, 4096},
+    {GL_MAX_CUBE_MAP_TEXTURE_SIZE, "GL_MAX_CUBE_MAP_TEXTURE_SIZE", 0, 4096},
+    {GL_MAX_RENDERBUFFER_SIZE, "GL_MAX_RENDERBUFFER_SIZE", 0, 4096},
+};
+
+const LimitFallback* FindLimitFallback(GLenum pname) {
+    for (const LimitFallback& entry : kLimitFallbacks) {
+        if (entry.pname == pname) return &entry;
+    }
+    return nullptr;
+}
+
+// Consumes the host error queue and reports whether anything was in it. Used to
+// tell "driver rejected this enum" apart from "driver answered, and 0 is real".
+bool ConsumeHostErrors() {
+    if (!GLES.glGetError) return false;
+    bool any = false;
+    while (GLES.glGetError() != GL_NO_ERROR) any = true;
+    return any;
+}
+
+GLint ResolveLimitFallback(const LimitFallback& entry) {
+    GLint value = 0;
+    if (entry.substitute && GLES.glGetIntegerv) {
+        GLES.glGetIntegerv(entry.substitute, &value);
+        if (value > 0) {
+            ConsumeHostErrors();
+            return value;
+        }
+        value = 0;
+    }
+    return entry.fallback;
+}
+
+// Diagnostics: report each offending pname once. Races can at worst produce a
+// duplicate line, which is harmless for a log file.
+constexpr int kMaxReportedPnames = 32;
+GLenum g_reported_pnames[kMaxReportedPnames];
+int g_reported_count = 0;
+bool g_reported_cap_hit = false;
+
+bool ReportOnce(GLenum pname) {
+    for (int i = 0; i < g_reported_count; ++i) {
+        if (g_reported_pnames[i] == pname) return false;
+    }
+    if (g_reported_count >= kMaxReportedPnames) {
+        if (!g_reported_cap_hit) {
+            g_reported_cap_hit = true;
+            LOG_W_FORCE("glGetIntegerv: more than %d distinct pnames read back as 0; further reports suppressed",
+                        kMaxReportedPnames);
+        }
+        return false;
+    }
+    g_reported_pnames[g_reported_count++] = pname;
+    return true;
+}
+
+void ReportContextFix(GLenum pname, long long value) {
+    if (!ReportOnce(pname)) return;
+    LOG_W_FORCE("glGetIntegerv(0x%x) read 0 until MobileGLES bound its fallback EGL context, then returned %lld. "
+                "The calling thread had no current EGL context.",
+                pname, value);
+}
+
+void ReportUntracked(GLenum pname, bool rejected) {
+    if (!ReportOnce(pname)) return;
+    LOG_W_FORCE("glGetIntegerv(0x%x) read back as 0 and the host %s. No fallback is registered for this enum, "
+                "so it is left at 0.",
+                pname, rejected ? "reported an error" : "reported no error");
+}
+
+void ReportSubstitution(GLenum pname, const LimitFallback& entry, GLint value, bool rejected) {
+    if (!ReportOnce(pname)) return;
+    LOG_W_FORCE("glGetIntegerv(%s / 0x%x) was not answered by the host GLES driver (%s); using %d instead of 0.",
+                entry.name, pname, rejected ? "GL error raised" : "value stayed 0", value);
+}
+
+// Asks the host for an integer limit, repairing the answer if the host never
+// gave one. Always returns something usable, or 0 when the limit is one we
+// have no opinion about.
+GLint QueryHostInt(GLenum pname) {
+    if (GLES.glGetIntegerv) {
+        GLint value = 0;
+        GLES.glGetIntegerv(pname, &value);
+        if (value > 0) return value;
+    }
+
+    // Maybe the thread simply had no context: re-read with ours bound.
+    {
+        ScopedHostContext scoped;
+        if (scoped.Bound() && GLES.glGetIntegerv) {
+            GLint retry = 0;
+            GLES.glGetIntegerv(pname, &retry);
+            if (retry > 0) {
+                ReportContextFix(pname, retry);
+                return retry;
+            }
+        }
+    }
+
+    const bool rejected = ConsumeHostErrors();
+    const LimitFallback* entry = FindLimitFallback(pname);
+    if (!entry) {
+        ReportUntracked(pname, rejected);
+        return 0;
+    }
+
+    const GLint value = ResolveLimitFallback(*entry);
+    ReportSubstitution(pname, *entry, value, rejected);
+    return value;
+}
+
+// Memoized QueryHostInt. Only a successful answer is stored: a query that ran
+// while this thread had no current context must not poison the cache with 0
+// for the rest of the process, which is exactly what the old per-pname
+// `static GLint cached = -1` blocks did.
+constexpr int kMaxCacheEntries = 32;
+GLenum g_cache_pnames[kMaxCacheEntries];
+GLint g_cache_values[kMaxCacheEntries];
+int g_cache_count = 0;
+std::mutex g_cache_mutex;
+
+GLint CachedHostInt(GLenum pname) {
+    std::lock_guard<std::mutex> lock(g_cache_mutex);
+
+    for (int i = 0; i < g_cache_count; ++i) {
+        if (g_cache_pnames[i] == pname) return g_cache_values[i];
+    }
+
+    const GLint value = QueryHostInt(pname);
+    if (value > 0 && g_cache_count < kMaxCacheEntries) {
+        g_cache_pnames[g_cache_count] = pname;
+        g_cache_values[g_cache_count] = value;
+        ++g_cache_count;
+    }
+    return value;
+}
+
+} // namespace limitguard
+
+void mg_guard_host_limit_i(GLenum pname, GLint* params) {
+    if (!params || *params > 0) return;
+    *params = limitguard::QueryHostInt(pname);
+}
+
+void mg_guard_host_limit_i64(GLenum pname, GLint64* params) {
+    using namespace limitguard;
+    if (!params || *params > 0) return;
+
+    {
+        ScopedHostContext scoped;
+        if (scoped.Bound() && GLES.glGetInteger64v) {
+            GLint64 retry = 0;
+            GLES.glGetInteger64v(pname, &retry);
+            if (retry > 0) {
+                *params = retry;
+                ReportContextFix(pname, (long long)retry);
+                return;
+            }
+        }
+    }
+
+    const bool rejected = ConsumeHostErrors();
+    const LimitFallback* entry = FindLimitFallback(pname);
+    if (!entry) {
+        ReportUntracked(pname, rejected);
+        return;
+    }
+
+    const GLint value = ResolveLimitFallback(*entry);
+    *params = (GLint64)value;
+    ReportSubstitution(pname, *entry, value, rejected);
+}
 
 // =============================================================================
 // Section: glGetIntegerv
@@ -93,94 +351,33 @@ void glGetIntegerv(GLenum pname, GLint* params) {
         // The GLES driver's max texture image units is a static property
         // of the context and never changes after creation. Cache it to
         // avoid a GLES round-trip on every query (some mods query this
-        // during per-frame state setup).
-        static GLint cached = -1;
-        if (cached == -1) [[unlikely]] {
-            int es_params = 16;
-            GLES.glGetIntegerv(pname, &es_params);
-            cached = es_params * 2;
-        }
+        // during per-frame state setup). Desktop GL guarantees at least
+        // twice the ES 3.2 minimum, so the doubled value is what callers
+        // expect to see.
+        static const GLint cached = limitguard::CachedHostInt(pname) * 2;
         (*params) = cached;
         break;
     }
 
-    case GL_MAX_VERTEX_ATTRIBS: {
-        static GLint cached = -1;
-        if (cached == -1) [[unlikely]] {
-            GLES.glGetIntegerv(pname, &cached);
-        }
-        (*params) = cached;
-        break;
-    }
-
-    case GL_MAX_DRAW_BUFFERS: {
-        static GLint cached = -1;
-        if (cached == -1) [[unlikely]] {
-            GLES.glGetIntegerv(pname, &cached);
-        }
-        (*params) = cached;
-        break;
-    }
-
-    case GL_MAX_VERTEX_UNIFORM_VECTORS: {
-        static GLint cached = -1;
-        if (cached == -1) [[unlikely]] {
-            GLES.glGetIntegerv(pname, &cached);
-        }
-        (*params) = cached;
-        break;
-    }
-
-    case GL_MAX_FRAGMENT_UNIFORM_VECTORS: {
-        static GLint cached = -1;
-        if (cached == -1) [[unlikely]] {
-            GLES.glGetIntegerv(pname, &cached);
-        }
-        (*params) = cached;
-        break;
-    }
-
-    case GL_MAX_VARYING_VECTORS: {
-        static GLint cached = -1;
-        if (cached == -1) [[unlikely]] {
-            GLES.glGetIntegerv(pname, &cached);
-        }
-        (*params) = cached;
-        break;
-    }
-
-    case GL_MAX_TEXTURE_SIZE: {
-        static GLint cached = -1;
-        if (cached == -1) [[unlikely]] {
-            GLES.glGetIntegerv(pname, &cached);
-        }
-        (*params) = cached;
-        break;
-    }
-
-    case GL_MAX_CUBE_MAP_TEXTURE_SIZE: {
-        static GLint cached = -1;
-        if (cached == -1) [[unlikely]] {
-            GLES.glGetIntegerv(pname, &cached);
-        }
-        (*params) = cached;
-        break;
-    }
-
-    case GL_MAX_RENDERBUFFER_SIZE: {
-        static GLint cached = -1;
-        if (cached == -1) [[unlikely]] {
-            GLES.glGetIntegerv(pname, &cached);
-        }
-        (*params) = cached;
-        break;
-    }
-
+    // -------------------------------------------------------------------------
+    // Static device limits — queried once and cached.
+    //
+    // These are properties of the GPU, so the answer never changes. But they
+    // were cached unconditionally: a query that ran while this thread had no
+    // current EGL context stored 0 and returned it for the rest of the session.
+    // CachedHostInt() retries under MobileGLES' fallback context and only
+    // memorizes a value the host actually reported.
+    // -------------------------------------------------------------------------
+    case GL_MAX_VERTEX_ATTRIBS:
+    case GL_MAX_DRAW_BUFFERS:
+    case GL_MAX_VERTEX_UNIFORM_VECTORS:
+    case GL_MAX_FRAGMENT_UNIFORM_VECTORS:
+    case GL_MAX_VARYING_VECTORS:
+    case GL_MAX_TEXTURE_SIZE:
+    case GL_MAX_CUBE_MAP_TEXTURE_SIZE:
+    case GL_MAX_RENDERBUFFER_SIZE:
     case GL_MAX_SAMPLES: {
-        static GLint cached = -1;
-        if (cached == -1) [[unlikely]] {
-            GLES.glGetIntegerv(pname, &cached);
-        }
+        static const GLint cached = limitguard::CachedHostInt(pname);
         (*params) = cached;
         break;
     }
@@ -221,7 +418,11 @@ void glGetIntegerv(GLenum pname, GLint* params) {
     // All other queries — forward to native ES 3.2 GLES
     // -------------------------------------------------------------------------
     default:
-        GLES.glGetIntegerv(pname, params);
+        // Zero it first so a driver that ignores the query leaves a defined
+        // value instead of whatever the caller's buffer happened to hold.
+        *params = 0;
+        if (GLES.glGetIntegerv) GLES.glGetIntegerv(pname, params);
+        mg_guard_host_limit_i(pname, params);
         LOG_D("  -> %d", *params)
         CHECK_GL_ERROR
     }
@@ -335,22 +536,6 @@ void AppendExtension(const char* ext) {
 // =============================================================================
 
 namespace {
-
-// Binds the fallback context for the duration of a query, but only when the
-// calling thread has no current context of its own.
-class ScopedHostContext {
-public:
-    ScopedHostContext() : bound_(BindFallbackEGLContextIfNeeded()) {}
-    ~ScopedHostContext() {
-        if (bound_) UnbindFallbackEGLContext();
-    }
-    ScopedHostContext(const ScopedHostContext&) = delete;
-    ScopedHostContext& operator=(const ScopedHostContext&) = delete;
-    bool Bound() const { return bound_; }
-
-private:
-    bool bound_;
-};
 
 // Asks the host driver for a string. The first attempt is made as-is, so the
 // common path costs nothing; only if that yields nothing do we bind the
