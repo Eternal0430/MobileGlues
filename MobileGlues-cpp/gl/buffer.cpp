@@ -635,6 +635,57 @@ void* glMapBuffer(GLenum target, GLenum access) {
     return ptr;
 }
 
+// ============================================================================
+// Persistent-mapping flag repair
+// ============================================================================
+namespace {
+
+// GL_MAP_UNSYNCHRONIZED_BIT asks the driver not to wait for pending work on the
+// buffer; GL_MAP_PERSISTENT_BIT asks it to keep the pointer valid while the GPU
+// keeps using that buffer. Asking for both at once is self-contradictory.
+//
+// Minecraft 26.3 does exactly that. GlBuffer.Direct builds its mapping flags as
+//   34  = GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT    (writable buffer)
+// | 192 = GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT     (immutable buffer)
+// = 226 (0xE2), and maps a buffer whose storage flags are
+//   194 = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT.
+// The core spec's error list does not name this combination, but Adreno and
+// turnip reject it: glMapBufferRange returns NULL and the game dies with
+// "IllegalStateException: Failed to map buffer" in
+// GlBuffer$Direct.map during RenderSystem.initRenderer.
+//
+// INVALIDATE_* is dropped alongside it: discarding the contents of a mapping
+// that is supposed to stay valid has the same problem.
+constexpr GLbitfield kPersistentConflictBits =
+    GL_MAP_UNSYNCHRONIZED_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT;
+
+GLenum DrainHostGLError() {
+    if (!GLES.glGetError) return GL_NO_ERROR;
+    GLenum last = GL_NO_ERROR;
+    for (;;) {
+        const GLenum e = GLES.glGetError();
+        if (e == GL_NO_ERROR) return last;
+        last = e;
+    }
+}
+
+// One attempt. Returns the pointer, or NULL with the host error in *errOut.
+void* TryMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access, GLenum* errOut) {
+    if (!GLES.glMapBufferRange) {
+        *errOut = GL_NO_ERROR;
+        return nullptr;
+    }
+    void* ptr = GLES.glMapBufferRange(target, offset, length, access);
+    if (ptr) {
+        *errOut = GL_NO_ERROR;
+        return ptr;
+    }
+    *errOut = DrainHostGLError();
+    return nullptr;
+}
+
+} // namespace
+
 void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
     LOG()
     if (global_settings.buffer_coherent_as_flush) access &= ~GL_MAP_FLUSH_EXPLICIT_BIT;
@@ -666,7 +717,42 @@ void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitf
             }
         }
     }
-    return GLES.glMapBufferRange(target, offset, length, access);
+    const GLbitfield requested = access;
+
+    // Drop whatever contradicts a persistent mapping before the first attempt.
+    if (access & GL_MAP_PERSISTENT_BIT) access &= ~kPersistentConflictBits;
+
+    GLenum err = GL_NO_ERROR;
+    void* ptr = TryMapBufferRange(target, offset, length, access, &err);
+    if (ptr) return ptr;
+
+    // Nothing. Minecraft turns the NULL into "IllegalStateException: Failed to
+    // map buffer", so leave everything needed to identify the rejected
+    // restriction in latest.log — including the GL error code, which the
+    // CHECK_GL_ERROR macro discards in release builds.
+    LOG_W_FORCE("glMapBufferRange failed: target=%s(0x%x) offset=%lld length=%lld requested=0x%x tried=0x%x "
+                "glError=0x%x",
+                glEnumToString(target), target, (long long)offset, (long long)length, requested, access, err);
+
+    // Retry without the persistence bits: if this buffer never actually got
+    // immutable persistent storage (a driver that refused the flags, or a build
+    // without GL_EXT_buffer_storage), persistence is what is being rejected.
+    if (access & (GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT)) {
+        const GLbitfield plain = access & ~(GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT | kPersistentConflictBits);
+        if (plain != access) {
+            ptr = TryMapBufferRange(target, offset, length, plain, &err);
+            if (ptr) {
+                LOG_W_FORCE("glMapBufferRange succeeded on retry without PERSISTENT/COHERENT "
+                            "(tried=0x%x); the buffer has no persistent storage",
+                            plain);
+                return ptr;
+            }
+            LOG_W_FORCE("glMapBufferRange retry without PERSISTENT/COHERENT also failed (tried=0x%x glError=0x%x)",
+                        plain, err);
+        }
+    }
+
+    return nullptr;
 }
 
 GLboolean glUnmapBuffer(GLenum target) {
@@ -917,6 +1003,14 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
                 pbo_shadow_alloc(g_bound_buffers_arr[idx], size, data);
             }
         }
+    } else {
+        // No GL_EXT_buffer_storage. Leaving the buffer without storage would
+        // make the subsequent glMapBufferRange fail with a NULL that tells the
+        // caller nothing, so allocate mutable storage instead. The mapping
+        // repair in glMapBufferRange drops the persistence bits to match.
+        LOG_W_FORCE("glBufferStorage: GL_EXT_buffer_storage is unavailable, falling back to glBufferData for %s",
+                    glEnumToString(target));
+        glBufferData(target, size, data, (flags & GL_DYNAMIC_STORAGE_BIT) ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW);
     }
     CHECK_GL_ERROR
 }
