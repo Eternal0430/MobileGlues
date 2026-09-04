@@ -1004,12 +1004,21 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
             }
         }
     } else {
-        // No GL_EXT_buffer_storage. Leaving the buffer without storage would
-        // make the subsequent glMapBufferRange fail with a NULL that tells the
-        // caller nothing, so allocate mutable storage instead. The mapping
-        // repair in glMapBufferRange drops the persistence bits to match.
-        LOG_W_FORCE("glBufferStorage: GL_EXT_buffer_storage is unavailable, falling back to glBufferData for %s",
-                    glEnumToString(target));
+        // No glBufferStorageEXT. Doing nothing here would leave the buffer
+        // without any storage, so the next glMapBufferRange returns NULL and
+        // the caller reports only "Failed to map buffer" — with no GL error in
+        // between, because nothing was ever sent to the driver.
+        //
+        // Allocate mutable storage instead. glMapBufferRange then drops the
+        // persistence bits on retry, since mutable storage has no storage
+        // flags to match them against.
+        static bool warned_once = false;
+        if (!warned_once) {
+            warned_once = true;
+            LOG_W_FORCE("glBufferStorage: glBufferStorageEXT is unavailable; falling back to glBufferData "
+                        "(first target=%s, size=%lld). Persistent mappings will be downgraded to plain ones.",
+                        glEnumToString(target), (long long)size);
+        }
         glBufferData(target, size, data, (flags & GL_DYNAMIC_STORAGE_BIT) ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW);
     }
     CHECK_GL_ERROR

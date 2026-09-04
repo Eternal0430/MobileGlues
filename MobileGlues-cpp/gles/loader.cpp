@@ -263,7 +263,25 @@ void InitGLESCapabilities() {
 
     // ---- Map optional ES extensions to desktop GL extensions ----
 
-    if (g_gles_caps.GL_EXT_buffer_storage) {
+    // Advertise ARB_buffer_storage only when the driver both claims the
+    // extension and actually handed us the entry point. Those two are
+    // independent: the string comes from glGetStringi, the pointer from
+    // eglGetProcAddress, and a driver (notably ported Mesa builds on Android)
+    // can advertise GL_EXT_buffer_storage while resolving glBufferStorageEXT
+    // to nothing.
+    //
+    // Advertising it anyway is what makes Minecraft choose its immutable
+    // buffer path: glBufferStorage silently does nothing, the buffer keeps no
+    // storage, and the first glMapBufferRange returns NULL — surfacing as
+    // "IllegalStateException: Failed to map buffer" during
+    // RenderSystem.initRenderer, with no GL error in between.
+    LOG_I("%sDetected GL_EXT_buffer_storage! (glBufferStorageEXT %s)",
+          g_gles_caps.GL_EXT_buffer_storage ? "" : "Not ", GLES.glBufferStorageEXT ? "resolved" : "MISSING")
+    if (g_gles_caps.GL_EXT_buffer_storage && !GLES.glBufferStorageEXT) {
+        LOG_W_FORCE("GL_EXT_buffer_storage is advertised but glBufferStorageEXT could not be resolved; "
+                    "withholding GL_ARB_buffer_storage so callers use mutable buffers")
+    }
+    if (g_gles_caps.GL_EXT_buffer_storage && GLES.glBufferStorageEXT) {
         AppendExtension("GL_ARB_buffer_storage");
     }
 
