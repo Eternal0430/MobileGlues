@@ -15,6 +15,8 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <chrono>
+#include <thread>
 
 #define DEBUG 0
 
@@ -213,6 +215,8 @@ struct ThreadFallback {
     // eglSwapBuffers runs — so the binding has to be corrected afterwards.
     EGLSurface bound_surface = EGL_NO_SURFACE;
     bool tried = false;
+    // Generation at which the last attempt was made; see BindFallback.
+    unsigned tried_generation = 0;
 };
 
 thread_local ThreadFallback t_fb;
@@ -417,8 +421,17 @@ bool BindFallbackEGLContextIfNeeded() {
     // only path any correctly configured thread takes after its first call.
     if (egl_eglGetCurrentContext() != EGL_NO_CONTEXT) return false;
 
-    if (t_fb.tried) return false;
+    // `tried` used to be latched for the life of the thread, so a thread whose
+    // first attempt failed — because no context was available yet, which is the
+    // normal state early in startup — was never given another chance. Every GL
+    // call it made afterwards was silently discarded, with no log, because the
+    // ladder was never entered again.
+    //
+    // Retry whenever the application's render target has changed, since that is
+    // exactly when a previously impossible binding may have become possible.
+    if (t_fb.tried && gen == t_fb.tried_generation) return false;
     t_fb.tried = true;
+    t_fb.tried_generation = gen;
 
     const AppRenderTarget& t = mg_egl_app_target();
     const bool have_app = t.have_binding && t.context != EGL_NO_CONTEXT;
@@ -515,6 +528,54 @@ bool BindFallbackEGLContextIfNeeded() {
                 "be discarded without error — a shader compile or a buffer map will fail with no explanation.",
                 CurrentThreadLabel());
     return false;
+}
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Watchdog
+//
+// The context layer is now observably correct: the log shows the render thread
+// bound to the surface the application created, with the application's own
+// context. And yet the game stops before a single eglSwapBuffers. Everything
+// that follows is therefore outside what this library logs, and guessing at it
+// has cost several rounds.
+//
+// This prints, every 20 seconds, whether GL work is still flowing and what the
+// render target looks like. A log that stops growing with a correct binding
+// means the stall is in game or driver code; one that keeps growing while
+// nothing is presented means the stall is in the presentation path.
+// ---------------------------------------------------------------------------
+std::atomic<unsigned long> g_guarded_calls{0};
+std::atomic<bool> g_watchdog_started{false};
+
+void WatchdogLoop() {
+    unsigned long last = 0;
+    int tick = 0;
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(20));
+        const unsigned long now = g_guarded_calls.load(std::memory_order_relaxed);
+        const unsigned long delta = now - last;
+        last = now;
+
+        const AppRenderTarget& t = mg_egl_app_target();
+        LOG_W_FORCE("watchdog #%d: %lu guarded GL calls this period (%lu total)%s | window surface=%p "
+                    "presenting=%p presenting thread=%s",
+                    ++tick, delta, now, delta == 0 ? " — NO GL CALLS, the game is not drawing" : "",
+                    t.draw_surface, t.presenting_surface,
+                    t.have_presenting ? "known" : "unknown (eglSwapBuffers has never run)");
+    }
+}
+
+}  // namespace
+
+void mg_egl_note_guarded_call() {
+    g_guarded_calls.fetch_add(1, std::memory_order_relaxed);
+    if (!g_watchdog_started.exchange(true)) {
+        // Detached and deliberately never joined: it outlives the GL session and
+        // costs one wake-up every 20 seconds.
+        std::thread(WatchdogLoop).detach();
+    }
 }
 
 // Pairs a successful BindFallbackEGLContextIfNeeded().

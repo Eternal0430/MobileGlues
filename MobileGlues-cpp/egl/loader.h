@@ -218,9 +218,14 @@ extern "C"
 // ==========================================================================
 #ifdef __cplusplus
 
+// Counts every guarded host GL call, across all threads. Read by the watchdog
+// below: if it stops growing, the game is stalled somewhere that is not making
+// GL calls, which tells us to look at game code rather than at this library.
+void mg_egl_note_guarded_call();
+
 class ScopedHostContext {
 public:
-    ScopedHostContext() : bound_(BindFallbackEGLContextIfNeeded()) {}
+    ScopedHostContext() : bound_(BindFallbackEGLContextIfNeeded()) { mg_egl_note_guarded_call(); }
     ~ScopedHostContext() {
         if (bound_) UnbindFallbackEGLContext();
     }

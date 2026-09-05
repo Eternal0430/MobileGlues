@@ -369,6 +369,14 @@ extern "C"
         LOG_D("eglMakeCurrent, dpy: %p, draw: %p, read: %p, ctx: %p", dpy, draw, read, ctx);
         LOAD_EGL(eglMakeCurrent)
         EGLBoolean ok = egl_eglMakeCurrent(dpy, draw, read, ctx);
+        if (ok != EGL_TRUE) {
+            // Previously invisible. A refused bind is exactly the kind of thing
+            // that leaves the application unable to present, and it was being
+            // dropped on the floor with no trace.
+            LOAD_EGL(eglGetError)
+            LOG_W_FORCE("eglMakeCurrent: the application's bind FAILED (0x%x) — dpy=%p draw=%p ctx=%p",
+                        egl_eglGetError(), dpy, draw, ctx);
+        }
         mg_egl_note_make_current(dpy, draw, read, ctx, ok);
         return ok;
     }
@@ -419,6 +427,10 @@ extern "C"
             CheckResolutionChange();
         } else {
             result = egl_eglSwapBuffers(dpy, surface);
+        }
+        if (result != EGL_TRUE) {
+            LOAD_EGL(eglGetError)
+            LOG_W_FORCE("eglSwapBuffers: FAILED (0x%x) surface=%p", egl_eglGetError(), surface);
         }
         mg_egl_note_swap(dpy, surface, result);
         return result;
