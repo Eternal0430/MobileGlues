@@ -616,7 +616,17 @@ extern "C"
             *data = static_cast<GLfloat>(ival);
             return;
         }
+        // Zero it first so a host that leaves the query unanswered (which is
+        // what happens when this thread has no current EGL context) yields a
+        // defined value rather than whatever the caller's buffer held.
+        *data = 0.0f;
         GLES.glGetFloatv(pname, data);
+        // glGetIntegerv and glGetInteger64v both repair unanswered device
+        // limits; this entry point did not, which is how
+        // GL_MAX_TEXTURE_MAX_ANISOTROPY reached Minecraft as 0 — it reads that
+        // one as a float, and Mth.floor(0) = 0 makes the sampler's valid range
+        // empty.
+        mg_guard_host_limit_f(pname, data);
     }
 
     GLAPI GLAPIENTRY void glGetInteger64v(GLenum pname, GLint64* data) {

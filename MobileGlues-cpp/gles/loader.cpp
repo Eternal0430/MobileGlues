@@ -428,6 +428,17 @@ void InitGLESCapabilities() {
 
     // Anisotropic texture filtering — only if detected on the GLES side
     if (g_gles_caps.EXT_texture_filter_anisotropic) {
+        // Report the real ceiling. Minecraft 26.3 validates the sampler's
+        // anisotropy against it and throws when the range is empty:
+        //     IllegalArgumentException: maxAnisotropy out of range;
+        //     must be >= 1 and <= 0, but was 1
+        // so a host that leaves it at 0 is worth naming here, in the part of
+        // the log that survives — gl/getter.cpp substitutes 16 in that case.
+        GLint max_anisotropy = 0;
+        if (GLES.glGetIntegerv) GLES.glGetIntegerv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &max_anisotropy);
+        LOG_I("%sDetected GL_EXT_texture_filter_anisotropic! (maxAnisotropy=%d%s)",
+              g_gles_caps.EXT_texture_filter_anisotropic ? "" : "Not ", max_anisotropy,
+              max_anisotropy > 0 ? "" : " — host did not answer, 16 will be substituted")
         AppendExtension("GL_EXT_texture_filter_anisotropic");
     }
 

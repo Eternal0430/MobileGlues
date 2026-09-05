@@ -100,6 +100,17 @@ const LimitFallback kLimitFallbacks[] = {
     {GL_MAX_TEXTURE_SIZE, "GL_MAX_TEXTURE_SIZE", 0, 4096},
     {GL_MAX_CUBE_MAP_TEXTURE_SIZE, "GL_MAX_CUBE_MAP_TEXTURE_SIZE", 0, 4096},
     {GL_MAX_RENDERBUFFER_SIZE, "GL_MAX_RENDERBUFFER_SIZE", 0, 4096},
+
+    // --- Anisotropic filtering. Minecraft 26.3 validates the sampler's
+    // --- anisotropy against this limit and throws outright when the range is
+    // --- empty:
+    // ---     IllegalArgumentException: maxAnisotropy out of range;
+    // ---     must be >= 1 and <= 0, but was 1
+    // --- So unlike the entries above, a 0 here is a hard crash rather than
+    // --- degraded visuals. 16 is what virtually every ES 3.2 mobile GPU
+    // --- reports; a host that supports less clamps the value itself, which
+    // --- the extension explicitly allows.
+    {GL_MAX_TEXTURE_MAX_ANISOTROPY, "GL_MAX_TEXTURE_MAX_ANISOTROPY", 0, 16},
 };
 
 const LimitFallback* FindLimitFallback(GLenum pname) {
@@ -240,6 +251,19 @@ GLint CachedHostInt(GLenum pname) {
 void mg_guard_host_limit_i(GLenum pname, GLint* params) {
     if (!params || *params > 0) return;
     *params = limitguard::QueryHostInt(pname);
+}
+
+void mg_guard_host_limit_f(GLenum pname, GLfloat* params) {
+    if (!params || *params > 0.0f) return;
+
+    // Check the table first. QueryHostInt() unconditionally asks the host for
+    // an int, and glGetFloatv also serves queries that are legitimately 0 or
+    // negative (ranges, clear values) — asking those as ints would raise
+    // GL_INVALID_ENUM for no reason. Only limits we actually track are touched.
+    if (!limitguard::FindLimitFallback(pname)) return;
+
+    const GLint value = limitguard::QueryHostInt(pname);
+    if (value > 0) *params = static_cast<GLfloat>(value);
 }
 
 void mg_guard_host_limit_i64(GLenum pname, GLint64* params) {
