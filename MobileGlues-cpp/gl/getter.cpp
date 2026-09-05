@@ -23,23 +23,8 @@
 
 #define DEBUG 0
 
-// Binds MobileGLES' fallback pbuffer context for the duration of a host query,
-// but only when the calling thread has no current EGL context of its own.
-// Host drivers leave results untouched when there is no current context, which
-// is how both a NULL glGetString and a zeroed glGetIntegerv reach the app.
-class ScopedHostContext {
-public:
-    ScopedHostContext() : bound_(BindFallbackEGLContextIfNeeded()) {}
-    ~ScopedHostContext() {
-        if (bound_) UnbindFallbackEGLContext();
-    }
-    ScopedHostContext(const ScopedHostContext&) = delete;
-    ScopedHostContext& operator=(const ScopedHostContext&) = delete;
-    bool Bound() const { return bound_; }
-
-private:
-    bool bound_;
-};
+// ScopedHostContext now lives in egl/loader.h so that gl/buffer.cpp can use
+// the same mechanism for host buffer operations.
 
 // =============================================================================
 // Section: Global State

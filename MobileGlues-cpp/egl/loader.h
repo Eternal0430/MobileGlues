@@ -186,4 +186,39 @@ extern "C"
 }
 #endif
 
+// ==========================================================================
+// ScopedHostContext — RAII wrapper around the fallback context
+//
+//   Binds MobileGLES' fallback pbuffer context for the duration of a host GL
+//   call, but only when the calling thread has no current EGL context of its
+//   own. Host drivers leave results untouched when there is no current
+//   context; that is how a NULL glGetString, a zeroed glGetIntegerv, and a
+//   NULL glMapBufferRange all reach the application.
+//
+//   Originally local to gl/getter.cpp (which only covers string and integer
+//   queries). Promoted here because buffer operations need it too: a buffer
+//   allocated and mapped while no context is current is silently dropped by
+//   the driver, which Minecraft reports as "Failed to map buffer".
+//
+//   Nesting is safe — an inner instance sees a current context and does
+//   nothing.
+// ==========================================================================
+#ifdef __cplusplus
+
+class ScopedHostContext {
+public:
+    ScopedHostContext() : bound_(BindFallbackEGLContextIfNeeded()) {}
+    ~ScopedHostContext() {
+        if (bound_) UnbindFallbackEGLContext();
+    }
+    ScopedHostContext(const ScopedHostContext&) = delete;
+    ScopedHostContext& operator=(const ScopedHostContext&) = delete;
+    bool Bound() const { return bound_; }
+
+private:
+    bool bound_;
+};
+
+#endif // __cplusplus
+
 #endif // FOLD_CRAFT_LAUNCHER_EGL_LOADER_H
