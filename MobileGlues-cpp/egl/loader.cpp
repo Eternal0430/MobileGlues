@@ -15,8 +15,11 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <algorithm>
 #include <chrono>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #define DEBUG 0
 
@@ -533,30 +536,104 @@ bool BindFallbackEGLContextIfNeeded() {
 namespace {
 
 // ---------------------------------------------------------------------------
+// Call histogram
+//
+// Lock-free open addressing keyed on the entry point's name. That name is a
+// __func__ string literal, so its address is stable for the life of the
+// process and can be compared directly — no hashing of contents, no allocation,
+// no lock. Guarded calls run at several thousand per second, so this has to be
+// cheaper than what it is measuring.
+// ---------------------------------------------------------------------------
+constexpr size_t kHistogramSlots = 512;
+
+struct CallSlot {
+    std::atomic<const char*> name{nullptr};
+    std::atomic<unsigned long> count{0};
+};
+
+CallSlot g_call_table[kHistogramSlots];
+
+void histogram_add(const char* name) {
+    size_t i = (reinterpret_cast<uintptr_t>(name) >> 4) & (kHistogramSlots - 1);
+    for (size_t probe = 0; probe < kHistogramSlots; ++probe) {
+        const char* cur = g_call_table[i].name.load(std::memory_order_acquire);
+        if (cur == name) {
+            g_call_table[i].count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (cur == nullptr) {
+            const char* expected = nullptr;
+            if (g_call_table[i].name.compare_exchange_strong(expected, name, std::memory_order_acq_rel)) {
+                g_call_table[i].count.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            // Someone else claimed the slot. If it was for the same name, count
+            // here; otherwise keep probing.
+            if (g_call_table[i].name.load(std::memory_order_acquire) == name) {
+                g_call_table[i].count.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+        i = (i + 1) & (kHistogramSlots - 1);
+    }
+    // Table full. Losing a few counts is harmless; the point is the ranking.
+}
+
+std::vector<std::pair<const char*, unsigned long>> histogram_snapshot() {
+    std::vector<std::pair<const char*, unsigned long>> out;
+    out.reserve(64);
+    for (size_t i = 0; i < kHistogramSlots; ++i) {
+        const char* n = g_call_table[i].name.load(std::memory_order_acquire);
+        if (!n) continue;
+        out.emplace_back(n, g_call_table[i].count.load(std::memory_order_relaxed));
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Watchdog
 //
-// The context layer is now observably correct: the log shows the render thread
-// bound to the surface the application created, with the application's own
-// context. And yet the game stops before a single eglSwapBuffers. Everything
-// that follows is therefore outside what this library logs, and guessing at it
-// has cost several rounds.
+// Added because the context layer became observably correct while the game
+// still never reached a frame, and everything past that point was outside what
+// this library logged. It answers, every 20 seconds, three questions that took
+// several rounds to even ask properly:
 //
-// This prints, every 20 seconds, whether GL work is still flowing and what the
-// render target looks like. A log that stops growing with a correct binding
-// means the stall is in game or driver code; one that keeps growing while
-// nothing is presented means the stall is in the presentation path.
+//   1. Is GL work still flowing, or is the game stalled in its own code?
+//   2. Has anything ever been presented?
+//   3. Which entry points account for the traffic?
+//
+// The third is the one that matters most. A sustained few thousand calls per
+// second with no eglSwapBuffers is either a render loop that cannot present, or
+// a compile loop that never finishes; those look identical from the outside and
+// are told apart instantly by which call dominates.
 // ---------------------------------------------------------------------------
 std::atomic<unsigned long> g_guarded_calls{0};
 std::atomic<bool> g_watchdog_started{false};
 
 void WatchdogLoop() {
-    unsigned long last = 0;
+    unsigned long last_total = 0;
+    std::vector<std::pair<const char*, unsigned long>> last_snapshot;
     int tick = 0;
+
     while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(20));
+
         const unsigned long now = g_guarded_calls.load(std::memory_order_relaxed);
-        const unsigned long delta = now - last;
-        last = now;
+        const unsigned long delta = now - last_total;
+        last_total = now;
+
+        auto snapshot = histogram_snapshot();
+        std::vector<std::pair<const char*, unsigned long>> deltas;
+        deltas.reserve(snapshot.size());
+        for (const auto& kv : snapshot) {
+            unsigned long before = 0;
+            for (const auto& old : last_snapshot)
+                if (old.first == kv.first) { before = old.second; break; }
+            if (kv.second > before) deltas.emplace_back(kv.first, kv.second - before);
+        }
+        std::sort(deltas.begin(), deltas.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        last_snapshot = std::move(snapshot);
 
         const AppRenderTarget& t = mg_egl_app_target();
         LOG_W_FORCE("watchdog #%d: %lu guarded GL calls this period (%lu total)%s | window surface=%p "
@@ -564,13 +641,19 @@ void WatchdogLoop() {
                     ++tick, delta, now, delta == 0 ? " — NO GL CALLS, the game is not drawing" : "",
                     t.draw_surface, t.presenting_surface,
                     t.have_presenting ? "known" : "unknown (eglSwapBuffers has never run)");
+
+        const size_t n = deltas.size() < 8 ? deltas.size() : 8;
+        for (size_t i = 0; i < n; ++i) {
+            LOG_W_FORCE("watchdog #%d:   %lu  %s", tick, deltas[i].second, deltas[i].first);
+        }
     }
 }
 
 }  // namespace
 
-void mg_egl_note_guarded_call() {
+void mg_egl_note_guarded_call(const char* entry_point) {
     g_guarded_calls.fetch_add(1, std::memory_order_relaxed);
+    histogram_add(entry_point);
     if (!g_watchdog_started.exchange(true)) {
         // Detached and deliberately never joined: it outlives the GL session and
         // costs one wake-up every 20 seconds.

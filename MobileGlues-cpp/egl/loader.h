@@ -90,6 +90,8 @@ extern "C"
 
     typedef EGLBoolean (*eglSwapBuffersWithDamageEXT_PTR)(EGLDisplay dpy, EGLSurface surface, EGLint* rects,
                                                           EGLint n_rects);
+    typedef EGLBoolean (*eglSwapBuffersWithDamageKHR_PTR)(EGLDisplay dpy, EGLSurface surface, EGLint* rects,
+                                                          EGLint n_rects);
 
     typedef EGLBoolean (*eglSwapInterval_PTR)(EGLDisplay dpy, EGLint interval);
 
@@ -136,6 +138,7 @@ extern "C"
         eglSurfaceAttrib_PTR eglSurfaceAttrib;
         eglSwapBuffers_PTR eglSwapBuffers;
         eglSwapBuffersWithDamageEXT_PTR eglSwapBuffersWithDamageEXT;
+        eglSwapBuffersWithDamageKHR_PTR eglSwapBuffersWithDamageKHR;
         eglSwapInterval_PTR eglSwapInterval;
         eglTerminate_PTR eglTerminate;
         eglUnlockSurfaceKHR_PTR eglUnlockSurfaceKHR;
@@ -218,14 +221,18 @@ extern "C"
 // ==========================================================================
 #ifdef __cplusplus
 
-// Counts every guarded host GL call, across all threads. Read by the watchdog
-// below: if it stops growing, the game is stalled somewhere that is not making
-// GL calls, which tells us to look at game code rather than at this library.
-void mg_egl_note_guarded_call();
+// Counts every guarded host GL call, across all threads, and attributes it to
+// the entry point that made it. Read by the watchdog below: if the count stops
+// growing, the game is stalled somewhere that is not making GL calls; if it
+// keeps growing while nothing is presented, the watchdog's per-entry breakdown
+// shows exactly which call is being repeated.
+void mg_egl_note_guarded_call(const char* entry_point);
 
 class ScopedHostContext {
 public:
-    ScopedHostContext() : bound_(BindFallbackEGLContextIfNeeded()) { mg_egl_note_guarded_call(); }
+    ScopedHostContext(const char* entry_point) : bound_(BindFallbackEGLContextIfNeeded()) {
+        mg_egl_note_guarded_call(entry_point);
+    }
     ~ScopedHostContext() {
         if (bound_) UnbindFallbackEGLContext();
     }

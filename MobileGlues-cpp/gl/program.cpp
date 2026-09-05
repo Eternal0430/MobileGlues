@@ -25,7 +25,7 @@
 // ============================================================================
 
 GLuint glCreateProgram() {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     GLuint program = GLES.glCreateProgram();
     // Track in state manager (virtual == real for programs)
@@ -37,7 +37,7 @@ GLuint glCreateProgram() {
 }
 
 void glDeleteProgram(GLuint program) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     auto &ss = GLState.shader;
     if (ss.currentProgram == program) {
@@ -63,7 +63,7 @@ void glDeleteProgram(GLuint program) {
 // glCompileShader is handled in shader.cpp
 
 void glDeleteShader(GLuint shader) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     auto &ss = GLState.shader;
     ss.shaderMap.erase(shader);
@@ -78,7 +78,7 @@ void glDeleteShader(GLuint shader) {
 // ============================================================================
 
 void glAttachShader(GLuint program, GLuint shader) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     GLES.glAttachShader(program, shader);
     // Track in state manager
@@ -93,7 +93,7 @@ void glAttachShader(GLuint program, GLuint shader) {
 }
 
 void glDetachShader(GLuint program, GLuint shader) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     GLES.glDetachShader(program, shader);
     auto &ss = GLState.shader;
@@ -106,7 +106,7 @@ void glDetachShader(GLuint program, GLuint shader) {
 }
 
 void glLinkProgram(GLuint program) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     GLES.glLinkProgram(program);
 
@@ -132,7 +132,7 @@ void glLinkProgram(GLuint program) {
 }
 
 void glValidateProgram(GLuint program) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     GLES.glValidateProgram(program);
 
@@ -162,7 +162,7 @@ void glValidateProgram(GLuint program) {
 // ============================================================================
 
 void glUseProgram(GLuint program) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     // Short-circuit: same program already active, skip the GLES driver call.
     // Safe because GLState.shader.currentProgram is kept in sync with the actual
@@ -180,31 +180,31 @@ void glUseProgram(GLuint program) {
 // ============================================================================
 
 void glGetProgramiv(GLuint program, GLenum pname, GLint* params) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     GLES.glGetProgramiv(program, pname, params);
 }
 
 void glGetShaderiv(GLuint shader, GLenum pname, GLint* params) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     GLES.glGetShaderiv(shader, pname, params);
 }
 
 void glGetProgramInfoLog(GLuint program, GLsizei bufSize, GLsizei* length, GLchar* infoLog) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     GLES.glGetProgramInfoLog(program, bufSize, length, infoLog);
     CHECK_GL_ERROR
 }
 
 void glGetShaderInfoLog(GLuint shader, GLsizei bufSize, GLsizei* length, GLchar* infoLog) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     GLES.glGetShaderInfoLog(shader, bufSize, length, infoLog);
     CHECK_GL_ERROR
 }
 
 void glGetAttachedShaders(GLuint program, GLsizei maxCount, GLsizei* count, GLuint* shaders) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     GLES.glGetAttachedShaders(program, maxCount, count, shaders);
     CHECK_GL_ERROR
@@ -215,14 +215,14 @@ void glGetAttachedShaders(GLuint program, GLsizei maxCount, GLsizei* count, GLui
 // ============================================================================
 
 void glBindAttribLocation(GLuint program, GLuint index, const GLchar* name) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     GLES.glBindAttribLocation(program, index, name);
     CHECK_GL_ERROR
 }
 
 GLint glGetAttribLocation(GLuint program, const GLchar* name) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     GLint result = GLES.glGetAttribLocation(program, name);
     CHECK_GL_ERROR
@@ -234,7 +234,7 @@ GLint glGetAttribLocation(GLuint program, const GLchar* name) {
 // ============================================================================
 
 GLint glGetUniformLocation(GLuint program, const GLchar* name) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     GLint result = GLES.glGetUniformLocation(program, name);
     CHECK_GL_ERROR
@@ -247,7 +247,7 @@ GLint glGetUniformLocation(GLuint program, const GLchar* name) {
 
 void glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize, GLsizei* length, GLint* size,
                        GLenum* type, GLchar* name) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     GLES.glGetActiveAttrib(program, index, bufSize, length, size, type, name);
     CHECK_GL_ERROR
@@ -255,7 +255,7 @@ void glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize, GLsizei* l
 
 void glGetActiveUniform(GLuint program, GLuint index, GLsizei bufSize, GLsizei* length, GLint* size,
                         GLenum* type, GLchar* name) {
-    ScopedHostContext __hostCtx;
+    ScopedHostContext __hostCtx(__func__);
     LOG()
     GLES.glGetActiveUniform(program, index, bufSize, length, size, type, name);
     CHECK_GL_ERROR

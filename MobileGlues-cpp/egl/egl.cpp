@@ -436,6 +436,54 @@ extern "C"
         return result;
     }
 
+    // Partial-swap variants.
+    //
+    // These were declared in the loader but never exported, and that gap
+    // explains a measurement that otherwise made no sense. On the device the
+    // watchdog reported a sustained few thousand guarded GL calls per second —
+    // a render loop, plainly running — while reporting, at the same time, that
+    // eglSwapBuffers had never once been called.
+    //
+    // If the application presents through one of these instead, every swap goes
+    // straight to the host: the presenting surface is never recorded, nothing
+    // here can tell where the frames are going, and the fallback has no way to
+    // know which surface the picture depends on. Exporting them makes those
+    // swaps visible and feeds the same tracking as eglSwapBuffers.
+    EGL_API EGLBoolean eglSwapBuffersWithDamageEXT(EGLDisplay dpy, EGLSurface surface, const EGLint* rects,
+                                                   EGLint n_rects) {
+        LOG_D("eglSwapBuffersWithDamageEXT, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
+        LOAD_EGL(eglSwapBuffersWithDamageEXT)
+        if (!egl_eglSwapBuffersWithDamageEXT) {
+            // Not available: fall back rather than drop the frame entirely.
+            LOG_W_FORCE("eglSwapBuffersWithDamageEXT: unavailable, using eglSwapBuffers for surface %p", surface);
+            return eglSwapBuffers(dpy, surface);
+        }
+        const EGLBoolean result = egl_eglSwapBuffersWithDamageEXT(dpy, surface, const_cast<EGLint*>(rects), n_rects);
+        if (result != EGL_TRUE) {
+            LOAD_EGL(eglGetError)
+            LOG_W_FORCE("eglSwapBuffersWithDamageEXT: FAILED (0x%x) surface=%p", egl_eglGetError(), surface);
+        }
+        mg_egl_note_swap(dpy, surface, result);
+        return result;
+    }
+
+    EGL_API EGLBoolean eglSwapBuffersWithDamageKHR(EGLDisplay dpy, EGLSurface surface, const EGLint* rects,
+                                                   EGLint n_rects) {
+        LOG_D("eglSwapBuffersWithDamageKHR, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
+        LOAD_EGL(eglSwapBuffersWithDamageKHR)
+        if (!egl_eglSwapBuffersWithDamageKHR) {
+            LOG_W_FORCE("eglSwapBuffersWithDamageKHR: unavailable, using eglSwapBuffers for surface %p", surface);
+            return eglSwapBuffers(dpy, surface);
+        }
+        const EGLBoolean result = egl_eglSwapBuffersWithDamageKHR(dpy, surface, const_cast<EGLint*>(rects), n_rects);
+        if (result != EGL_TRUE) {
+            LOAD_EGL(eglGetError)
+            LOG_W_FORCE("eglSwapBuffersWithDamageKHR: FAILED (0x%x) surface=%p", egl_eglGetError(), surface);
+        }
+        mg_egl_note_swap(dpy, surface, result);
+        return result;
+    }
+
     EGL_API EGLBoolean eglCopyBuffers(EGLDisplay dpy, EGLSurface surface, EGLNativePixmapType target) {
         LOG_D("eglCopyBuffers, dpy: %p, surface: %p, target: %p", dpy, surface, target);
         LOAD_EGL(eglCopyBuffers)
