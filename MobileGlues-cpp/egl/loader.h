@@ -182,6 +182,22 @@ extern "C"
     bool BindFallbackEGLContextIfNeeded();
     void UnbindFallbackEGLContext();
 
+    // -------------------------------------------------------------------------
+    // EnsureHostContext — the variant every host GL entry point should use.
+    //
+    // Binds the fallback context when the calling thread has none, and then
+    // LEAVES IT BOUND. Unbinding after each call would mean two eglMakeCurrent
+    // round-trips per GL entry point, which on a context-less thread applies to
+    // every draw call and every texture upload — far too slow. Leaving it bound
+    // makes every subsequent guard a single eglGetCurrentContext TLS read.
+    //
+    // When the thread already has a context (the normal case) this does
+    // nothing at all, so it cannot disturb a working setup.
+    //
+    // Returns true only if this call is the one that bound the context.
+    // -------------------------------------------------------------------------
+    bool EnsureHostContext();
+
 #ifdef __cplusplus
 }
 #endif
@@ -202,17 +218,20 @@ extern "C"
 //
 //   Nesting is safe — an inner instance sees a current context and does
 //   nothing.
+//
+//   The context is deliberately left bound on exit: see EnsureHostContext.
+//   The destructor is kept so that the type stays an RAII scope marker and so
+//   that existing call sites need no changes.
 // ==========================================================================
 #ifdef __cplusplus
 
 class ScopedHostContext {
 public:
-    ScopedHostContext() : bound_(BindFallbackEGLContextIfNeeded()) {}
-    ~ScopedHostContext() {
-        if (bound_) UnbindFallbackEGLContext();
-    }
+    ScopedHostContext() : bound_(EnsureHostContext()) {}
     ScopedHostContext(const ScopedHostContext&) = delete;
     ScopedHostContext& operator=(const ScopedHostContext&) = delete;
+    // True when this instance is the one that bound the context, i.e. the
+    // thread had none and any result read before this point is suspect.
     bool Bound() const { return bound_; }
 
 private:

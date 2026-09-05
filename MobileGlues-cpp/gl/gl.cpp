@@ -14,6 +14,7 @@
 #include <GL/gl.h>
 #include "glcorearb.h"
 #include "log.h"
+#include "../egl/loader.h"
 #include "framebuffer.h"
 #include "../gles/loader.h"
 #include "mg.h"
@@ -26,6 +27,7 @@
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glClearDepth(GLclampd depth) {
+    ScopedHostContext __hostCtx;
     GLES.glClearDepthf((float)depth);
     GLState.legacy.clearDepth = (GLfloat)depth;
 }
@@ -35,6 +37,7 @@ extern "C" GLAPI GLAPIENTRY void glClearDepth(GLclampd depth) {
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glClear(GLbitfield mask) {
+    ScopedHostContext __hostCtx;
     // GL_ACCUM_BUFFER_BIT is not supported in ES, strip it
     mask &= ~0x00000200; // GL_ACCUM_BUFFER_BIT
     GLES.glClear(mask);
@@ -45,6 +48,7 @@ extern "C" GLAPI GLAPIENTRY void glClear(GLbitfield mask) {
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glHint(GLenum target, GLenum mode) {
+    ScopedHostContext __hostCtx;
     GLES.glHint(target, mode);
 }
 
@@ -53,6 +57,7 @@ extern "C" GLAPI GLAPIENTRY void glHint(GLenum target, GLenum mode) {
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glDrawBuffer(GLenum mode) {
+    ScopedHostContext __hostCtx;
     if (mode == GL_NONE) {
         GLenum none = GL_NONE;
         GLES.glDrawBuffers(1, &none);
@@ -92,6 +97,7 @@ extern "C" GLAPI GLAPIENTRY void glDrawBuffer(GLenum mode) {
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glReadBuffer(GLenum mode) {
+    ScopedHostContext __hostCtx;
     // GLES 3.2 restricts the legal values: GL_NONE / GL_BACK on the default
     // framebuffer, GL_NONE / GL_COLOR_ATTACHMENTi on a user FBO. Desktop GL
     // additionally allows GL_FRONT, GL_LEFT, GL_RIGHT, GL_AUX0..3, etc.

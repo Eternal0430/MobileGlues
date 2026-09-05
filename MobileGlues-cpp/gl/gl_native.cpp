@@ -15,6 +15,7 @@
 #include <GL/gl.h>
 #include "glcorearb.h"
 #include "log.h"
+#include "../egl/loader.h"
 #include "../gles/loader.h"
 #include "mg.h"
 #include <GLES3/gl32.h>
@@ -368,6 +369,7 @@ NATIVE_FUNCTION_HEAD(void, glDrawElementsInstancedBaseVertex, GLenum mode, GLsiz
 // glDispatchCompute is handled in drawing.cpp (atomic counter emulation)
 extern "C" GLAPI GLAPIENTRY void glDispatchComputeIndirectARB(GLintptr indirect) __attribute__((alias("glDispatchComputeIndirect")));
 extern "C" GLAPI GLAPIENTRY void glDispatchComputeIndirect(GLintptr indirect) {
+    ScopedHostContext __hostCtx;
     GLES.glDispatchComputeIndirect(indirect);
 }
 // glDrawBuffers is handled in framebuffer.cpp (attachment remapping)
@@ -381,6 +383,7 @@ NATIVE_FUNCTION_HEAD(void, glBlendEquation, GLenum mode) NATIVE_FUNCTION_END_NO_
 NATIVE_FUNCTION_HEAD(void, glBlendEquationSeparate, GLenum modeRGB, GLenum modeAlpha) NATIVE_FUNCTION_END_NO_RETURN(void, glBlendEquationSeparate, modeRGB,modeAlpha)
 extern "C" GLAPI GLAPIENTRY void glBlendFuncARB(GLenum sfactor, GLenum dfactor) __attribute__((alias("glBlendFunc")));
 extern "C" GLAPI GLAPIENTRY void glBlendFunc(GLenum sfactor, GLenum dfactor) {
+    ScopedHostContext __hostCtx;
     if (g_blendSfactor == sfactor && g_blendDfactor == dfactor) [[likely]] return;
     g_blendSfactor = sfactor;
     g_blendDfactor = dfactor;
@@ -393,6 +396,7 @@ NATIVE_FUNCTION_HEAD(void, glBlendFunci, GLuint buf, GLenum src, GLenum dst) NAT
 NATIVE_FUNCTION_HEAD(void, glBlendFuncSeparatei, GLuint buf, GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha) NATIVE_FUNCTION_END_NO_RETURN(void, glBlendFuncSeparatei, buf,srcRGB,dstRGB,srcAlpha,dstAlpha)
 extern "C" GLAPI GLAPIENTRY void glColorMaskARB(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) __attribute__((alias("glColorMask")));
 extern "C" GLAPI GLAPIENTRY void glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha) {
+    ScopedHostContext __hostCtx;
     if (g_colorMaskInit && g_colorMask[0] == red && g_colorMask[1] == green &&
         g_colorMask[2] == blue && g_colorMask[3] == alpha) [[likely]] return;
     g_colorMask[0] = red; g_colorMask[1] = green;
@@ -417,6 +421,7 @@ NATIVE_FUNCTION_HEAD(void, glReadnPixels, GLint x, GLint y, GLsizei width, GLsiz
 
 extern "C" GLAPI GLAPIENTRY void glScissorARB(GLint x, GLint y, GLsizei width, GLsizei height) __attribute__((alias("glScissor")));
 extern "C" GLAPI GLAPIENTRY void glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
+    ScopedHostContext __hostCtx;
     if (g_scissorInit && g_scissor[0] == x && g_scissor[1] == y &&
         g_scissor[2] == width && g_scissor[3] == height) [[likely]] return;
     g_scissor[0] = x; g_scissor[1] = y;
@@ -439,12 +444,14 @@ NATIVE_FUNCTION_HEAD(void, glPatchParameteri, GLenum pname, GLint value) NATIVE_
 
 extern "C" GLAPI GLAPIENTRY void glDepthFuncARB(GLenum func) __attribute__((alias("glDepthFunc")));
 extern "C" GLAPI GLAPIENTRY void glDepthFunc(GLenum func) {
+    ScopedHostContext __hostCtx;
     if (g_depthFunc == func) [[likely]] return;
     g_depthFunc = func;
     GLES.glDepthFunc(func);
 }
 extern "C" GLAPI GLAPIENTRY void glDepthMaskARB(GLboolean flag) __attribute__((alias("glDepthMask")));
 extern "C" GLAPI GLAPIENTRY void glDepthMask(GLboolean flag) {
+    ScopedHostContext __hostCtx;
     if (g_depthMaskInit && g_depthMask == flag) [[likely]] return;
     g_depthMask = flag;
     g_depthMaskInit = true;
@@ -464,12 +471,14 @@ NATIVE_FUNCTION_HEAD(void, glStencilOpSeparate, GLenum face, GLenum sfail, GLenu
 
 extern "C" GLAPI GLAPIENTRY void glCullFaceARB(GLenum mode) __attribute__((alias("glCullFace")));
 extern "C" GLAPI GLAPIENTRY void glCullFace(GLenum mode) {
+    ScopedHostContext __hostCtx;
     if (g_cullFace == mode) [[likely]] return;
     g_cullFace = mode;
     GLES.glCullFace(mode);
 }
 extern "C" GLAPI GLAPIENTRY void glFrontFaceARB(GLenum mode) __attribute__((alias("glFrontFace")));
 extern "C" GLAPI GLAPIENTRY void glFrontFace(GLenum mode) {
+    ScopedHostContext __hostCtx;
     if (g_frontFace == mode) [[likely]] return;
     g_frontFace = mode;
     GLES.glFrontFace(mode);
@@ -482,11 +491,13 @@ extern "C" GLAPI GLAPIENTRY void glFrontFace(GLenum mode) {
 // glFinish / glFlush
 extern "C" GLAPI GLAPIENTRY void glFinishARB(void) __attribute__((alias("glFinish")));
 extern "C" GLAPI GLAPIENTRY void glFinish(void) {
+    ScopedHostContext __hostCtx;
     GLES.glFinish();
 }
 
 extern "C" GLAPI GLAPIENTRY void glFlushARB(void) __attribute__((alias("glFlush")));
 extern "C" GLAPI GLAPIENTRY void glFlush(void) {
+    ScopedHostContext __hostCtx;
     GLES.glFlush();
 }
 

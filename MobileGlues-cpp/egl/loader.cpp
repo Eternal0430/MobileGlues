@@ -159,6 +159,56 @@ bool BindFallbackEGLContextIfNeeded() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// EnsureHostContext — bind once, then leave it bound
+//
+// A host GLES driver discards every call made from a thread with no current
+// EGL context: no object is created, no error is raised, queries simply return
+// 0 or NULL. That is not a theoretical concern here — it is what produced the
+// NULL glGetString, the zeroed glGetIntegerv, the NULL glMapBufferRange and
+// the zero maxAnisotropy earlier in this session, all on the same render
+// thread. Each of those stopped reproducing once the call was wrapped in a
+// scoped fallback binding.
+//
+// The earlier scoped variant bound and immediately unbound, which is correct
+// but costs two eglMakeCurrent calls per GL entry point. On a thread that has
+// no context of its own that would apply to every draw and every texture
+// upload, which is far too slow. So bind once and keep it: after the first
+// call the thread has a current context, every later guard is a single TLS
+// read, and the overhead disappears.
+//
+// Returns true only when this call is the one that bound the context, so
+// callers can tell "the previous result was suspect, re-read it" from
+// "a context was already there".
+// ---------------------------------------------------------------------------
+static thread_local bool t_warned_about_missing_context = false;
+
+bool EnsureHostContext() {
+    if (!g_fallback_context_ready) return false;
+
+    LOAD_EGL(eglGetCurrentContext);
+    if (egl_eglGetCurrentContext() != EGL_NO_CONTEXT) return false;
+
+    LOAD_EGL(eglMakeCurrent);
+    LOAD_EGL(eglGetError);
+
+    if (egl_eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext) != EGL_TRUE) {
+        LOG_W_FORCE("EnsureHostContext: eglMakeCurrent failed (0x%x) — host GL calls from this thread will be "
+                    "silently discarded",
+                    egl_eglGetError());
+        return false;
+    }
+
+    if (!t_warned_about_missing_context) {
+        t_warned_about_missing_context = true;
+        LOG_W_FORCE("EnsureHostContext: this thread had no current EGL context, so MobileGLES bound its fallback "
+                    "pbuffer context and left it bound. Every host GL call made from a context-less thread is "
+                    "discarded without error, which is how a shader compile or a buffer map fails with no "
+                    "explanation. This indicates the launcher never called eglMakeCurrent on the render thread.");
+    }
+    return true;
+}
+
 void UnbindFallbackEGLContext() {
     if (!g_fallback_context_ready) return;
 
