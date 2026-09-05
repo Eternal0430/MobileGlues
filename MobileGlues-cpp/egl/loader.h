@@ -281,11 +281,23 @@ struct AppRenderTarget {
 };
 
 // Called from eglCreateWindowSurface: records the surface the application
-// presents from.
+// presents from. Tracks the latest, not the first — SDL creates more than one.
 void mg_egl_note_window_surface(EGLDisplay dpy, EGLConfig config, EGLSurface surface);
 
-// Called from eglMakeCurrent after the host returns.
+// Called from eglMakeCurrent after the host returns. Tracks the application's
+// live binding, so it always reflects what is current now rather than whatever
+// happened to be bound first.
 void mg_egl_note_make_current(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx, EGLBoolean ok);
+
+// Called from eglDestroySurface. A destroyed surface must be forgotten, or the
+// next attempt to bind it fails with EGL_BAD_SURFACE and drawing goes nowhere.
+void mg_egl_note_destroy_surface(EGLDisplay dpy, EGLSurface surface);
+
+// Forgets a surface after the driver rejected it as EGL_BAD_SURFACE, without
+// waiting for eglDestroySurface. Self-healing: a surface can die through a path
+// this library does not intercept, and using a dead one silently discards every
+// draw call.
+void mg_egl_forget_surface(EGLSurface surface);
 
 // Called from eglSwapBuffers, for diagnostics.
 void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok);

@@ -50,38 +50,116 @@ unsigned mg_egl_app_target_generation() {
 void mg_egl_note_window_surface(EGLDisplay dpy, EGLConfig config, EGLSurface surface) {
     if (surface == EGL_NO_SURFACE) return;
     std::lock_guard<std::mutex> lock(g_target_mutex);
-    if (g_target.have_surface) return;  // first window surface wins; later ones
-                                        // are resize/recreate churn that would
-                                        // only replace a good target with a
-                                        // temporarily unusable one
+    if (g_target.have_surface && g_target.draw_surface == surface) return;
+
+    const bool replaced = g_target.have_surface;
     g_target.display = dpy;
     g_target.config = config;
     g_target.draw_surface = surface;
     g_target.read_surface = surface;
     g_target.have_surface = true;
     g_target_generation.fetch_add(1, std::memory_order_acq_rel);
-    LOG_W_FORCE("eglCreateWindowSurface: recorded the application's window surface=%p config=%p", surface, config);
+    LOG_W_FORCE("eglCreateWindowSurface: the application's window surface is now %p (config %p)%s", surface, config,
+                replaced ? " — replacing a previously recorded surface" : "");
 }
 
 void mg_egl_note_make_current(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx, EGLBoolean ok) {
-    if (ok != EGL_TRUE || ctx == EGL_NO_CONTEXT) return;
+    if (ok != EGL_TRUE) return;
     std::lock_guard<std::mutex> lock(g_target_mutex);
-    if (g_target.have_binding) return;  // the first successful bind is the
-                                        // application's render thread; later
-                                        // binds are our own fallbacks
+
+    // Release: the application let go of the context on this thread. Nothing to
+    // record beyond the fact, but it is logged — a release on the render thread
+    // is what leaves it with no context and starts this whole search.
+    if (ctx == EGL_NO_CONTEXT) {
+        LOG_W_FORCE("eglMakeCurrent: the application released its context on pthread=%lu",
+                    (unsigned long)pthread_self());
+        return;
+    }
+
+    // Tracked live, on every call, rather than latched on the first.
+    //
+    // Latching the first binding was a mistake measured on real hardware. SDL
+    // binds a context and a surface, then destroys that surface and creates
+    // another — the log shows "reusing primary window" and a second
+    // eglChooseConfig right after the first successful bind. Recording only the
+    // first meant the recorded surface was dead by the time it was used:
+    //
+    //     eglMakeCurrent: recorded ... surface=0x77bbd1d380
+    //     app context + recorded window surface: NOT BOUND (err=0x300d)
+    //
+    // 0x300d is EGL_BAD_SURFACE. The surface was real when bound and gone by
+    // the time it was needed, so the fallback fell through to a surfaceless
+    // bind and every draw went nowhere.
+    const bool ctx_changed = !g_target.have_binding || g_target.context != ctx;
+    const bool surf_changed = g_target.draw_surface != draw;
+
     g_target.display = dpy;
-    g_target.draw_surface = draw;
-    g_target.read_surface = read;
     g_target.context = ctx;
     g_target.have_binding = true;
-    g_target_generation.fetch_add(1, std::memory_order_acq_rel);
-    LOG_W_FORCE("eglMakeCurrent: recorded the application's binding surface=%p ctx=%p (thread %lu)", draw, ctx,
-                (unsigned long)pthread_self());
+    if (draw != EGL_NO_SURFACE) {
+        g_target.draw_surface = draw;
+        g_target.read_surface = read;
+        g_target.have_surface = true;
+    }
+
+    if (ctx_changed || surf_changed) {
+        g_target_generation.fetch_add(1, std::memory_order_acq_rel);
+        LOG_W_FORCE("eglMakeCurrent: the application's live binding is now surface=%p ctx=%p (pthread=%lu)",
+                    draw, ctx, (unsigned long)pthread_self());
+    }
 
     if (draw == EGL_NO_SURFACE) {
         LOG_W_FORCE("eglMakeCurrent: the application bound a context with NO SURFACE — it cannot present. "
                     "Drawing will go nowhere unless a surface is bound later.");
     }
+}
+
+void mg_egl_note_destroy_surface(EGLDisplay dpy, EGLSurface surface) {
+    if (surface == EGL_NO_SURFACE) return;
+    std::lock_guard<std::mutex> lock(g_target_mutex);
+
+    bool matched = false;
+    if (g_target.have_surface && g_target.draw_surface == surface) {
+        g_target.draw_surface = EGL_NO_SURFACE;
+        g_target.read_surface = EGL_NO_SURFACE;
+        g_target.have_surface = false;
+        matched = true;
+    }
+    if (g_target.have_presenting && g_target.presenting_surface == surface) {
+        g_target.presenting_surface = EGL_NO_SURFACE;
+        g_target.presenting_thread = 0;
+        g_target.have_presenting = false;
+        matched = true;
+    }
+    if (!matched) return;
+
+    g_target_generation.fetch_add(1, std::memory_order_acq_rel);
+    LOG_W_FORCE("eglDestroySurface: the application destroyed surface %p, which was the recorded render target — "
+                "forgotten it, so the next bind will not fail with EGL_BAD_SURFACE",
+                surface);
+}
+
+void mg_egl_forget_surface(EGLSurface surface) {
+    if (surface == EGL_NO_SURFACE) return;
+    std::lock_guard<std::mutex> lock(g_target_mutex);
+
+    bool matched = false;
+    if (g_target.have_surface && g_target.draw_surface == surface) {
+        g_target.draw_surface = EGL_NO_SURFACE;
+        g_target.read_surface = EGL_NO_SURFACE;
+        g_target.have_surface = false;
+        matched = true;
+    }
+    if (g_target.have_presenting && g_target.presenting_surface == surface) {
+        g_target.presenting_surface = EGL_NO_SURFACE;
+        g_target.presenting_thread = 0;
+        g_target.have_presenting = false;
+        matched = true;
+    }
+    if (!matched) return;
+
+    g_target_generation.fetch_add(1, std::memory_order_acq_rel);
+    LOG_W_FORCE("forgot surface %p after the driver rejected it — it will not be used again", surface);
 }
 
 void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok) {
@@ -204,7 +282,9 @@ extern "C"
     EGL_API EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface surface) {
         LOG_D("eglDestroySurface, dpy: %p, surface: %p", dpy, surface);
         LOAD_EGL(eglDestroySurface)
-        return egl_eglDestroySurface(dpy, surface);
+        EGLBoolean ok = egl_eglDestroySurface(dpy, surface);
+        if (ok == EGL_TRUE) mg_egl_note_destroy_surface(dpy, surface);
+        return ok;
     }
 
     EGL_API EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface surface, EGLint attribute, EGLint* value) {
