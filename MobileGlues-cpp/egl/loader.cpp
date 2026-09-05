@@ -17,14 +17,11 @@
 #define DEBUG 0
 
 static EGLDisplay eglDisplay = EGL_NO_DISPLAY;
-static EGLSurface eglSurface = EGL_NO_SURFACE;
 static EGLContext eglContext = EGL_NO_CONTEXT;
-
-// Kept so that per-thread fallback contexts can be created later with the same
-// configuration. The primary context above is created during init and is kept
-// bound to whichever thread ran that init; other threads need their own.
-static EGLConfig g_pbuf_config = nullptr;
-static bool g_pbuf_config_valid = false;
+// Not used. Kept as a named constant at the binding sites instead, so that the
+// absence of a surface is visible where it matters: this context is
+// surfaceless, see init_target_egl().
+static const EGLSurface kNoSurface = EGL_NO_SURFACE;
 
 // Set once init_target_egl() succeeds. The context is intentionally kept alive
 // (see the note in loader.h) so that host GLES queries can be answered on
@@ -36,8 +33,6 @@ void init_target_egl() {
     LOAD_EGL(eglBindAPI);
     LOAD_EGL(eglInitialize);
     LOAD_EGL(eglGetDisplay);
-    LOAD_EGL(eglCreatePbufferSurface);
-    LOAD_EGL(eglDestroySurface);
     LOAD_EGL(eglDestroyContext);
     LOAD_EGL(eglMakeCurrent);
     LOAD_EGL(eglChooseConfig);
@@ -54,17 +49,13 @@ void init_target_egl() {
                               8,
                               EGL_ALPHA_SIZE,
                               8,
-                              EGL_SURFACE_TYPE,
-                              EGL_PBUFFER_BIT,
                               EGL_RENDERABLE_TYPE,
                               EGL_OPENGL_ES2_BIT,
                               EGL_NONE};
 
     EGLint ctxAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
 
-    EGLint pbAttribs[] = {EGL_WIDTH, 32, EGL_HEIGHT, 32, EGL_NONE};
-
-    EGLConfig pbufConfig;
+    EGLConfig config;
     EGLint configsFound = 0;
 
     eglDisplay = egl_eglGetDisplay(EGL_DEFAULT_DISPLAY);
@@ -83,14 +74,15 @@ void init_target_egl() {
         goto cleanup;
     }
 
-    if (egl_eglChooseConfig(eglDisplay, configAttribs, &pbufConfig, 1, &configsFound) != EGL_TRUE) {
+    if (egl_eglChooseConfig(eglDisplay, configAttribs, &config, 1, &configsFound) != EGL_TRUE) {
         LOG_E("eglChooseConfig failed (0x%x)", egl_eglGetError());
         goto cleanup;
     }
 
     if (configsFound == 0) {
+        // EGL_ALPHA_SIZE, at index 6.
         configAttribs[6] = 0;
-        if (egl_eglChooseConfig(eglDisplay, configAttribs, &pbufConfig, 1, &configsFound) != EGL_TRUE) {
+        if (egl_eglChooseConfig(eglDisplay, configAttribs, &config, 1, &configsFound) != EGL_TRUE) {
             LOG_E("Retry eglChooseConfig failed (0x%x)", egl_eglGetError());
             goto cleanup;
         }
@@ -101,22 +93,24 @@ void init_target_egl() {
             goto cleanup;
         }
     }
-    g_pbuf_config = pbufConfig;
-    g_pbuf_config_valid = true;
 
-    eglContext = egl_eglCreateContext(eglDisplay, pbufConfig, EGL_NO_CONTEXT, ctxAttribs);
+    eglContext = egl_eglCreateContext(eglDisplay, config, EGL_NO_CONTEXT, ctxAttribs);
     if (eglContext == EGL_NO_CONTEXT) {
         LOG_E("eglCreateContext failed (0x%x)", egl_eglGetError());
         goto cleanup;
     }
 
-    eglSurface = egl_eglCreatePbufferSurface(eglDisplay, pbufConfig, pbAttribs);
-    if (eglSurface == EGL_NO_SURFACE) {
-        LOG_E("eglCreatePbufferSurface failed (0x%x)", egl_eglGetError());
-        goto cleanup;
-    }
-
-    if (egl_eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext) != EGL_TRUE) {
+    // Bind with no surface at all. EGL_KHR_surfaceless_context is required for
+    // this, and it is available here — config/gpu_utils.cpp has been doing
+    // exactly this on this device for the whole session: it is how
+    // "Using graphics device: Adreno (TM) 619" got into the log, and that
+    // string comes from a glGetString issued on a surfaceless context.
+    //
+    // No pbuffer is created anywhere in this library any more. A pbuffer is a
+    // valid render target that is not connected to the display, which is
+    // precisely the wrong thing to hand a thread that expects to be drawing to
+    // the screen: every call succeeds and nothing is ever visible.
+    if (egl_eglMakeCurrent(eglDisplay, kNoSurface, kNoSurface, eglContext) != EGL_TRUE) {
         LOG_E("eglMakeCurrent failed (0x%x)", egl_eglGetError());
         goto cleanup;
     }
@@ -126,9 +120,6 @@ void init_target_egl() {
     return;
 
 cleanup:
-    if (eglSurface != EGL_NO_SURFACE) {
-        egl_eglDestroySurface(eglDisplay, eglSurface);
-    }
     if (eglContext != EGL_NO_CONTEXT) {
         egl_eglDestroyContext(eglDisplay, eglContext);
     }
@@ -141,272 +132,169 @@ cleanup:
 void destroy_temp_egl_ctx() {
     LOAD_EGL(eglMakeCurrent);
 
-    // Only unbind the context from this thread. The display/context/surface
-    // objects themselves are kept alive: they serve as the fallback context for
-    // host GLES string queries issued from threads without a current context
+    // Only unbind the context from this thread. The display and the context
+    // themselves are kept alive: they are the last-resort fallback for host GLES
+    // queries issued before the application has created a context of its own
     // (see BindFallbackEGLContextIfNeeded below).
-    egl_eglMakeCurrent(eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    egl_eglMakeCurrent(eglDisplay, kNoSurface, kNoSurface, EGL_NO_CONTEXT);
 }
 
 // ---------------------------------------------------------------------------
-// Per-thread fallback contexts
+// Fallback contexts, without pbuffers
 //
-// Every thread that issues host GL calls without a current context gets its OWN
-// pbuffer context, created on first need and then left current for the life of
-// the thread. Two earlier designs both failed on real hardware, and the shape of
-// each failure is what motivates this one:
+// Three designs were tried on this device and the shape of each failure is what
+// motivates this one. All three created an off-screen pbuffer; none of them can
+// work, and the reason is the same in every case.
 //
-//   1. One shared context, bound and released around every call ("borrowed").
-//      Two eglMakeCurrent round-trips per GL entry point is not just slow — on
-//      Adreno/turnip it corrupts state across calls. A session with this design
-//      logged 15 glMapBufferRange failures (GL_INVALID_OPERATION, buffers that
-//      demonstrably had storage), 1 glBufferStorage rejection and 14 texture
-//      uploads with no texture bound, and the gui pipeline's vertex shader
-//      failed to compile with an empty info log (the signature of a driver that
-//      discarded the call outright).
+//   1. One shared pbuffer context, bound and released around every call.
+//      Two eglMakeCurrent round-trips per GL entry point. On Adreno/turnip that
+//      is not merely slow, it corrupts state across calls: a session logged
+//      15 glMapBufferRange failures on buffers that demonstrably had storage,
+//      a glBufferStorage rejection, 14 texture uploads with nothing bound, and
+//      a vertex shader that failed to compile with an empty info log — the
+//      signature of a driver discarding the call outright.
 //
-//   2. One shared context, bound and kept ("sticky"). GL state survives, but an
-//      EGLContext may be current on only one thread, so when the render thread
-//      held it across CompletableFuture.join() the background executor's shader
-//      compile could never acquire it. That is the hang, not a slow path.
+//   2. One shared pbuffer context, bound and kept. State survives, but an
+//      EGLContext may be current on only one thread. The render thread held it
+//      across CompletableFuture.join() while the background executor was trying
+//      to compile shaders, and neither could proceed. That is the hang.
 //
-// One context per thread has neither problem: nothing is shared, so nothing can
-// contend, and the context stays current, so state is never torn down. The
-// contexts share a share group so that buffers, textures, shaders and programs
-// created on any of them remain visible to the others.
+//   3. One pbuffer context per thread, bound and kept. No contention and no
+//      churn — and a permanently black screen, because a pbuffer is a valid
+//      render target that is not connected to the display. The render thread
+//      asks for a fallback before SDL has created the window, so it gets a
+//      pbuffer, and nothing re-examined that decision afterwards. Every draw
+//      call succeeded; every pixel went somewhere invisible; eglSwapBuffers
+//      presented a window surface nothing had been drawn into.
 //
-// It also makes the guards cheap. After the first call on a thread, every later
-// guard is a single eglGetCurrentContext() that finds a context already current
-// and does nothing — and it means the GL entry points that were never wrapped
-// (glBindBuffer, glBindBufferBase, glGetBufferParameteriv, ...) still work,
-// because the context is current whether or not they asked for it. That gap is
-// precisely what broke design 1.
+// The common mistake is that all three invent a context. This one does not.
+// It binds the context the application already made, to the surface the
+// application already presents from. That is not a convenience — it is the only
+// arrangement in which drawing from a fallback thread can be visible, and it
+// also settles object sharing for free, because it is the same context: every
+// texture, buffer, shader and program the application created is already there.
+//
+// The application's context exists before the window does (SDL's
+// eglCreateContext is logged before the fallback is first needed), so the
+// binding starts surfaceless — which EGL_KHR_surfaceless_context allows, and
+// which this device supports — and moves onto the window surface as soon as one
+// appears. Rebinding a context to a different surface is defined behaviour and
+// keeps every object created so far.
+//
+// No pbuffer surface and no EGLContext is created here at all.
 // ---------------------------------------------------------------------------
 namespace {
 
 struct ThreadFallback {
     EGLContext ctx = EGL_NO_CONTEXT;
-    EGLSurface surf = EGL_NO_SURFACE;
-    // True when `surf` is a pbuffer this thread created. The application's own
-    // window surface must never be destroyed here.
-    bool owns_surface = false;
+    EGLDisplay dpy = EGL_NO_DISPLAY;
+    // The context is bound to the application's window surface, so drawing is
+    // visible. False means surfaceless: GL calls work, nothing can be seen.
+    bool on_window = false;
     bool tried = false;
-
-    ~ThreadFallback() {
-        if (ctx == EGL_NO_CONTEXT) return;
-        // Runs at thread exit. The display may already be gone; the calls are
-        // best-effort and a failure here is harmless.
-        LOAD_EGL(eglGetCurrentContext);
-        LOAD_EGL(eglMakeCurrent);
-        LOAD_EGL(eglDestroySurface);
-        LOAD_EGL(eglDestroyContext);
-        if (egl_eglGetCurrentContext && egl_eglGetCurrentContext() == ctx) {
-            egl_eglMakeCurrent(eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        }
-        if (owns_surface && egl_eglDestroySurface) egl_eglDestroySurface(eglDisplay, surf);
-        if (egl_eglDestroyContext) egl_eglDestroyContext(eglDisplay, ctx);
-        ctx = EGL_NO_CONTEXT;
-        surf = EGL_NO_SURFACE;
-        owns_surface = false;
-    }
 };
 
-thread_local ThreadFallback t_fallback;
-// Last render-target generation this thread acted on; see BindFallbackEGLContextIfNeeded.
+thread_local ThreadFallback t_fb;
+// Last render-target generation this thread acted on; see
+// BindFallbackEGLContextIfNeeded.
 thread_local unsigned t_seen_generation = 0;
 
-// Creates a context and binds it to the surface the application presents from.
+// Binds the context to the surface the application presents from, or
+// surfaceless when no window surface exists yet.
 //
-// This is the difference between a working frame and a black screen. A pbuffer
-// is a perfectly valid render target that is not connected to the display, so
-// every draw call succeeds and nothing appears; eglSwapBuffers then presents
-// the window surface, into which nothing was ever drawn.
-//
-// The context is created sharing with the application's own context, so
-// textures, buffers, shaders and programs created on either are visible to
-// both — without that, this thread would have a context but none of the game's
-// objects.
-bool TryBindToAppSurface() {
-    const AppRenderTarget& t = mg_egl_app_target();
-    if (!t.have_surface || t.draw_surface == EGL_NO_SURFACE) return false;
-
-    LOAD_EGL(eglCreateContext);
-    LOAD_EGL(eglCreatePbufferSurface);
+// Returns false when the binding fails, which for a context means another
+// thread holds it — that is worth reporting rather than papering over, because
+// it means the application is rendering somewhere other than here.
+bool BindAppContext(EGLDisplay dpy, EGLContext ctx, EGLSurface draw, EGLSurface read) {
     LOAD_EGL(eglMakeCurrent);
     LOAD_EGL(eglGetError);
-
-    EGLConfig config = t.config ? t.config : g_pbuf_config;
-    if (!config || !egl_eglCreateContext) return false;
-
-    const EGLint ctxAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
-
-    EGLContext ctx = egl_eglCreateContext(t.display, config,
-                                          t.context != EGL_NO_CONTEXT ? t.context : EGL_NO_CONTEXT, ctxAttribs);
-    if (ctx == EGL_NO_CONTEXT) {
-        LOG_W_FORCE("TryBindToAppSurface: eglCreateContext failed (0x%x)", egl_eglGetError());
-        return false;
-    }
-
-    // EGL allows a surface to be current for only one context at a time, so
-    // this fails if the application still holds it — which is the case we want
-    // to detect, not to fight.
-    if (egl_eglMakeCurrent(t.display, t.draw_surface, t.read_surface, ctx) != EGL_TRUE) {
-        const EGLint err = egl_eglGetError();
-        LOAD_EGL(eglDestroyContext);
-        if (egl_eglDestroyContext) egl_eglDestroyContext(t.display, ctx);
-        LOG_W_FORCE("TryBindToAppSurface: could not bind the application's window surface (0x%x) — it is current "
-                    "on another thread, so this thread will fall back to an off-screen pbuffer and whatever it "
-                    "draws will not be visible",
-                    err);
-        return false;
-    }
-
-    t_fallback.ctx = ctx;
-    t_fallback.surf = t.draw_surface;
-    t_fallback.owns_surface = false;  // the application owns it
-    LOG_W_FORCE("TryBindToAppSurface: bound a companion context (sharing with the application's context %p) to the "
-                "application's window surface %p, so drawing from this thread will be visible",
-                t.context, t.draw_surface);
-    return true;
-}
-
-// Moves an existing fallback context off its private pbuffer and onto the
-// surface the application presents from.
-//
-// This exists because of an ordering problem measured on real hardware: the
-// render thread asks for a fallback at startup, before SDL has created the
-// window, so it gets an off-screen pbuffer. Nothing re-examines that decision,
-// so the thread spends the rest of the process drawing into a 32x32 surface
-// nobody can see while eglSwapBuffers presents the untouched window surface.
-// The observable result is a black screen with working audio.
-//
-// The context is kept and only the surface changes, which is what makes this
-// safe to do mid-run: every object the thread has created stays valid, and
-// rebinding a context to a different surface is defined behaviour in EGL.
-bool TryUpgradeToAppSurface() {
-    if (!t_fallback.owns_surface || t_fallback.ctx == EGL_NO_CONTEXT) return false;
-
-    const AppRenderTarget& t = mg_egl_app_target();
-    if (!t.have_surface || t.draw_surface == EGL_NO_SURFACE) return false;
-
-    LOAD_EGL(eglMakeCurrent);
-    LOAD_EGL(eglGetCurrentContext);
-    LOAD_EGL(eglGetError);
-    LOAD_EGL(eglDestroySurface);
-
-    // If we no longer hold the context, this thread found a real one meanwhile.
-    if (egl_eglGetCurrentContext() != t_fallback.ctx) return false;
-
-    if (egl_eglMakeCurrent(t.display, t.draw_surface, t.read_surface, t_fallback.ctx) != EGL_TRUE) {
-        LOG_W_FORCE("TryUpgradeToAppSurface: could not move to the window surface (0x%x) — it is current on "
-                    "another thread, so this thread stays on an off-screen pbuffer and its drawing will not be "
-                    "visible",
-                    egl_eglGetError());
-        return false;
-    }
-
-    EGLSurface old = t_fallback.surf;
-    t_fallback.surf = t.draw_surface;
-    t_fallback.owns_surface = false;
-    if (egl_eglDestroySurface) egl_eglDestroySurface(eglDisplay, old);
-
-    LOG_W_FORCE("TryUpgradeToAppSurface: this thread was drawing into an off-screen pbuffer; it is now bound to the "
-                "application's window surface %p, so its drawing will be visible",
-                t.draw_surface);
-    return true;
-}
-
-bool TryBindToPrivatePbuffer() {
-    if (!g_pbuf_config_valid) return false;
-
-    LOAD_EGL(eglCreateContext);
-    LOAD_EGL(eglCreatePbufferSurface);
-    LOAD_EGL(eglGetError);
-
-    if (!egl_eglCreateContext || !egl_eglCreatePbufferSurface) return false;
-
-    const EGLint ctxAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
-    const EGLint pbAttribs[] = {EGL_WIDTH, 32, EGL_HEIGHT, 32, EGL_NONE};
-
-    EGLContext ctx = egl_eglCreateContext(eglDisplay, g_pbuf_config, eglContext, ctxAttribs);
-    if (ctx == EGL_NO_CONTEXT) {
-        LOG_W_FORCE("BindFallbackEGLContext: eglCreateContext for this thread failed (0x%x)", egl_eglGetError());
-        return false;
-    }
-
-    EGLSurface surf = egl_eglCreatePbufferSurface(eglDisplay, g_pbuf_config, pbAttribs);
-    if (surf == EGL_NO_SURFACE) {
-        LOG_W_FORCE("BindFallbackEGLContext: eglCreatePbufferSurface failed (0x%x)", egl_eglGetError());
-        LOAD_EGL(eglDestroyContext);
-        if (egl_eglDestroyContext) egl_eglDestroyContext(eglDisplay, ctx);
-        return false;
-    }
-
-    t_fallback.ctx = ctx;
-    t_fallback.surf = surf;
-    t_fallback.owns_surface = true;
-    LOG_W_FORCE("BindFallbackEGLContext: WARNING — this thread is bound to an off-screen pbuffer, not to the "
-                "application's window surface. Drawing here is valid but invisible. This is the cause of a black "
-                "screen with working audio.");
-    return true;
+    return egl_eglMakeCurrent(dpy, draw, read, ctx) == EGL_TRUE;
 }
 
 } // namespace
 
 bool BindFallbackEGLContextIfNeeded() {
-    if (!g_fallback_context_ready) return false;
-
     LOAD_EGL(eglGetCurrentContext);
     LOAD_EGL(eglMakeCurrent);
     LOAD_EGL(eglGetError);
 
-    // Re-examine an off-screen fallback whenever the application's render
-    // target changes. This is the whole cost of the guard once a thread has a
-    // context: one atomic load, and a real check only on the frames where
-    // something about the target actually changed.
+    const AppRenderTarget& t = mg_egl_app_target();
+
+    // Re-examine a surfaceless binding whenever the application's render target
+    // changes, so that a thread which arrived before the window existed is not
+    // left drawing into nothing for the rest of the process. This is the entire
+    // cost of the guard on the hot path: one atomic load, and a real bind only
+    // on the frames where the target actually changed.
     const unsigned gen = mg_egl_app_target_generation();
     if (gen != t_seen_generation) {
         t_seen_generation = gen;
-        if (t_fallback.owns_surface) TryUpgradeToAppSurface();
+        if (t_fb.ctx != EGL_NO_CONTEXT && !t_fb.on_window && t.have_surface) {
+            if (BindAppContext(t.display, t_fb.ctx, t.draw_surface, t.read_surface)) {
+                t_fb.on_window = true;
+                LOG_W_FORCE("BindFallbackEGLContext: this thread was surfaceless and is now bound to the "
+                            "application's window surface %p, so its drawing will be visible",
+                            t.draw_surface);
+            }
+        }
     }
 
-    // Already have a context — nothing to do. This is the path every correctly
-    // configured thread takes after the first call, and the only path a thread
-    // with a real context ever takes.
+    // Already have a context: the path every correctly configured thread takes,
+    // and the only path a thread holding a real context ever takes.
     if (egl_eglGetCurrentContext() != EGL_NO_CONTEXT) return false;
 
-    if (!t_fallback.tried) {
-        t_fallback.tried = true;
-        // Prefer the surface the application presents from. Only if that is
-        // unavailable — no window surface yet, or it is current on another
-        // thread — take an off-screen pbuffer, which keeps GL calls working at
-        // the cost of drawing into something nobody can see.
-        if (!TryBindToAppSurface()) TryBindToPrivatePbuffer();
+    if (t_fb.tried) return false;
+    t_fb.tried = true;
+
+    // The application's own context, onto the window surface if there is one.
+    // Same context means the application's objects are already visible.
+    if (t.have_binding && t.context != EGL_NO_CONTEXT) {
+        const bool have_surface = t.have_surface && t.draw_surface != EGL_NO_SURFACE;
+        if (BindAppContext(t.display, t.context, have_surface ? t.draw_surface : kNoSurface,
+                           have_surface ? t.read_surface : kNoSurface)) {
+            t_fb.ctx = t.context;
+            t_fb.dpy = t.display;
+            t_fb.on_window = have_surface;
+            if (have_surface) {
+                LOG_W_FORCE("BindFallbackEGLContext: bound the application's own context %p to the application's "
+                            "window surface %p, so drawing from this thread is visible",
+                            t.context, t.draw_surface);
+            } else {
+                LOG_W_FORCE("BindFallbackEGLContext: bound the application's own context %p with NO SURFACE — no "
+                            "window surface exists yet. GL calls work but nothing can be presented; this thread "
+                            "will move onto the window surface as soon as one is created",
+                            t.context);
+            }
+            return true;
+        }
+        const EGLint err = egl_eglGetError();
+        LOG_W_FORCE("BindFallbackEGLContext: the application's context %p is current on another thread (0x%x). "
+                    "This thread is not the one the application is rendering on, and no substitute is being "
+                    "created: a new context cannot be bound to a surface another context already holds, so any "
+                    "drawing here would be invisible anyway",
+                    t.context, err);
     }
 
-    EGLContext ctx = t_fallback.ctx != EGL_NO_CONTEXT ? t_fallback.ctx : eglContext;
-    EGLSurface surf = t_fallback.ctx != EGL_NO_CONTEXT ? t_fallback.surf : eglSurface;
-
-    if (ctx == EGL_NO_CONTEXT) return false;
-
-    if (egl_eglMakeCurrent(eglDisplay, surf, surf, ctx) != EGL_TRUE) {
-        LOG_W_FORCE("BindFallbackEGLContext: eglMakeCurrent failed (0x%x) — host GL calls from this thread will be "
-                    "silently discarded",
-                    egl_eglGetError());
-        return false;
+    // Startup context, as a last resort: it predates the application's window
+    // and exists only so that queries issued before any context is available
+    // have somewhere to run.
+    if (eglContext != EGL_NO_CONTEXT && BindAppContext(eglDisplay, eglContext, kNoSurface, kNoSurface)) {
+        t_fb.ctx = eglContext;
+        t_fb.dpy = eglDisplay;
+        t_fb.on_window = false;
+        LOG_W_FORCE("BindFallbackEGLContext: no application context was available, so this thread is bound to the "
+                    "startup context surfacelessly. Queries and shader compiles work; drawing does not. This "
+                    "runs before the application has created a context and should not persist once it has.");
+        return true;
     }
 
-    LOG_W_FORCE("BindFallbackEGLContext: this thread had no current EGL context, so MobileGLES gave it one and left "
-                "it bound for the life of the thread. Every host GL call made from a context-less thread is "
-                "discarded without error, which is how a shader compile or a buffer map fails with no "
-                "explanation. This indicates the launcher never called eglMakeCurrent on this thread.");
-    return true;
+    LOG_W_FORCE("BindFallbackEGLContext: no context could be bound at all — host GL calls from this thread will be "
+                "silently discarded");
+    return false;
 }
 
 // Pairs a successful BindFallbackEGLContextIfNeeded().
 //
-// Deliberately does nothing: the context belongs to this thread alone, so there
-// is nothing to give back. Releasing it would reintroduce both failures above —
-// the per-call eglMakeCurrent churn that corrupts driver state, and the window
-// in which another thread could take the context.
+// Deliberately does nothing: the context stays current for the life of the
+// thread. Releasing it would reintroduce the per-call churn that corrupts
+// driver state, and the window in which another thread could take it.
 void UnbindFallbackEGLContext() {}

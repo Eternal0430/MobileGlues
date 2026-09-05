@@ -205,11 +205,11 @@ extern "C"
 //   Nesting is safe — an inner instance sees a current context and does
 //   nothing.
 //
-//   The context belongs to the calling thread and stays current after the
-//   scope ends; see the "Per-thread fallback contexts" note in loader.cpp for
-//   the two designs this replaced. Practically, that means the guard costs one
-//   eglGetCurrentContext() after the first call on a thread, and that GL entry
-//   points which were never wrapped still see a current context.
+//   The context stays current after the scope ends; see "Fallback contexts,
+//   without pbuffers" in loader.cpp for the three designs this replaced.
+//   Practically, that means the guard costs one eglGetCurrentContext() after the
+//   first call on a thread, and that GL entry points which were never wrapped
+//   still see a current context.
 // ==========================================================================
 #ifdef __cplusplus
 
@@ -232,15 +232,18 @@ private:
 // ---------------------------------------------------------------------------
 // The application's real render target
 //
-// A pbuffer context is fine for answering a query, but not for drawing: nothing
-// rendered into a 32x32 off-screen pbuffer can ever reach the screen, and
-// eglSwapBuffers(windowSurface) has nothing to present because the draw calls
-// never went to that surface. That is a black screen with working audio — the
-// game runs, the pipeline is alive, only the pixels go nowhere.
+// A fallback context is only useful if drawing on it is visible, and that
+// requires the context and the surface the application actually presents from.
+// Anything else — a pbuffer, a context of our own, a context bound with no
+// surface — renders correctly into something nobody can see, while
+// eglSwapBuffers presents the untouched window surface. That is a black screen
+// with working audio: the game runs, the pipeline is alive, only the pixels go
+// nowhere.
 //
-// So the fallback needs the surface the application actually presents from.
-// These are filled in by egl.cpp, which sees every EGL call the application
-// makes, and read by BindFallbackEGLContextIfNeeded().
+// So the fallback binds the application's own context to the application's own
+// window surface, and these calls exist to report which those are. They are made
+// from egl.cpp, which sees every EGL call the application makes, and read by
+// BindFallbackEGLContextIfNeeded().
 // ---------------------------------------------------------------------------
 
 struct AppRenderTarget {
@@ -253,8 +256,8 @@ struct AppRenderTarget {
     bool have_binding = false;  // a context was successfully made current
 };
 
-// Called from eglCreateWindowSurface: records the surface and the config that
-// produced it, since a companion context must be created from a matching config.
+// Called from eglCreateWindowSurface: records the surface the application
+// presents from.
 void mg_egl_note_window_surface(EGLDisplay dpy, EGLConfig config, EGLSurface surface);
 
 // Called from eglMakeCurrent after the host returns.
