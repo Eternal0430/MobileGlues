@@ -529,6 +529,7 @@ void glGenBuffers(GLsizei n, GLuint* buffers) {
 }
 
 void glDeleteBuffers(GLsizei n, const GLuint* buffers) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glDeleteBuffers(%i, %p)", n, buffers)
     for (int i = 0; i < n; ++i) {
@@ -554,6 +555,7 @@ GLboolean glIsBuffer(GLuint buffer) {
 // ============================================================================
 
 void glBindBuffer(GLenum target, GLuint buffer) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glBindBuffer, target = %s, buffer = %d", glEnumToString(target), buffer)
     set_bound_buffer_by_target(target, buffer);
@@ -1007,6 +1009,7 @@ void bindAllAtomicCounterAsSSBO() {
 }
 
 void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glBindBufferRange, target = %s, index = %d, buffer = %d, offset = %p, size = %zi", glEnumToString(target),
           index, buffer, (void*)offset, size)
@@ -1052,6 +1055,7 @@ void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offs
 }
 
 void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glBindBufferBase, target = %s, index = %d, buffer = %d", glEnumToString(target), index, buffer)
 
@@ -1085,6 +1089,7 @@ void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
 // ============================================================================
 
 void glBindVertexBuffer(GLuint bindingindex, GLuint buffer, GLintptr offset, GLsizei stride) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glBindVertexBuffer, bindingindex = %d, buffer = %d, offset = %p, stride = %i", bindingindex, buffer, offset,
           stride)
@@ -1113,6 +1118,7 @@ void glBindVertexBuffer(GLuint bindingindex, GLuint buffer, GLintptr offset, GLs
 // ============================================================================
 
 void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glCopyBufferSubData, readTarget = %s, writeTarget = %s, readOffset = %d, writeOffset = %d, size = %d",
           glEnumToString(readTarget), glEnumToString(writeTarget), readOffset, writeOffset, size)
@@ -1125,6 +1131,7 @@ void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOff
 // ============================================================================
 
 void glGetBufferParameteriv(GLenum target, GLenum pname, GLint* params) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glGetBufferParameteriv, target = %s, pname = %s", glEnumToString(target), glEnumToString(pname))
     GLES.glGetBufferParameteriv(target, pname, params);
@@ -1132,6 +1139,7 @@ void glGetBufferParameteriv(GLenum target, GLenum pname, GLint* params) {
 }
 
 void glGetBufferParameteri64v(GLenum target, GLenum pname, GLint64* params) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glGetBufferParameteri64v, target = %s, pname = %s", glEnumToString(target), glEnumToString(pname))
     GLES.glGetBufferParameteri64v(target, pname, params);
@@ -1139,6 +1147,7 @@ void glGetBufferParameteri64v(GLenum target, GLenum pname, GLint64* params) {
 }
 
 void glGetBufferPointerv(GLenum target, GLenum pname, void** params) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glGetBufferPointerv, target = %s, pname = %s", glEnumToString(target), glEnumToString(pname))
     GLES.glGetBufferPointerv(target, pname, params);
@@ -1252,6 +1261,7 @@ static inline GLuint resolve_tbo_buffer(GLuint buffer) {
 }
 
 void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glTexBuffer, target = %s, internalformat = %s, buffer = %d", glEnumToString(target),
           glEnumToString(internalformat), buffer)
@@ -1264,6 +1274,7 @@ void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer) {
 }
 
 void glTexBufferRange(GLenum target, GLenum internalformat, GLuint buffer, GLintptr offset, GLsizeiptr size) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glTexBufferRange, target = %s, internalformat = %s, buffer = %d, offset = %p, size = %zi",
           glEnumToString(target), glEnumToString(internalformat), buffer, (void*)offset, size)
@@ -1288,6 +1299,7 @@ void glGenVertexArrays(GLsizei n, GLuint* arrays) {
 }
 
 void glDeleteVertexArrays(GLsizei n, const GLuint* arrays) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glDeleteVertexArrays(%i, %p)", n, arrays)
     for (int i = 0; i < n; ++i) {
@@ -1309,6 +1321,7 @@ GLboolean glIsVertexArray(GLuint array) {
 }
 
 void glBindVertexArray(GLuint array) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glBindVertexArray(%d)", array)
 

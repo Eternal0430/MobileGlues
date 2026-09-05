@@ -175,9 +175,11 @@ extern "C"
     // strlen(NULL) when a game queried GL_RENDERER from a thread that had not
     // called eglMakeCurrent yet.
     //
-    // BindFallbackEGLContextIfNeeded() binds that context on the calling thread
-    // only if the thread has no current context. It returns true when the
-    // caller must later call UnbindFallbackEGLContext().
+    // BindFallbackEGLContextIfNeeded() gives the calling thread a fallback
+    // context of its own when it has no current context, and leaves it current
+    // for the life of the thread. UnbindFallbackEGLContext() is kept for
+    // callers that pair the two but intentionally does nothing — see
+    // "Per-thread fallback contexts" in loader.cpp.
     // -------------------------------------------------------------------------
     bool BindFallbackEGLContextIfNeeded();
     void UnbindFallbackEGLContext();
@@ -203,14 +205,11 @@ extern "C"
 //   Nesting is safe — an inner instance sees a current context and does
 //   nothing.
 //
-//   The context is released on exit, and must be. Minecraft compiles shaders
-//   on Util.backgroundExecutor() while the render thread blocks in
-//   CompletableFuture.join(); that worker calls glCreateShader /
-//   glCompileShader, so both threads need the fallback context. Holding it
-//   across the join would deadlock — the worker waiting for a context the
-//   render thread will not give up until the worker finishes. Borrowing it for
-//   the duration of one call is what makes that arrangement work. Access is
-//   serialised by a mutex so two context-less threads never hold it at once.
+//   The context belongs to the calling thread and stays current after the
+//   scope ends; see the "Per-thread fallback contexts" note in loader.cpp for
+//   the two designs this replaced. Practically, that means the guard costs one
+//   eglGetCurrentContext() after the first call on a thread, and that GL entry
+//   points which were never wrapped still see a current context.
 // ==========================================================================
 #ifdef __cplusplus
 

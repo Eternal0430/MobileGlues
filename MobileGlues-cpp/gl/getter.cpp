@@ -873,6 +873,7 @@ const GLubyte* glGetString(GLenum name) {
 // =============================================================================
 
 const GLubyte* glGetStringi(GLenum name, GLuint index) {
+    ScopedHostContext __hostCtx;
     LOG()
 
     if (name == GL_EXTENSIONS + GL_BACKEND_GETTER_MG && global_settings.hide_mg_env_level == HideMGEnvLevel::Disabled) {
@@ -972,6 +973,7 @@ const GLubyte* glGetStringi(GLenum name, GLuint index) {
 // =============================================================================
 
 void glGetQueryObjectiv(GLuint id, GLenum pname, GLint* params) {
+    ScopedHostContext __hostCtx;
     LOG()
     if (GLES.glGetQueryObjectivEXT) {
         GLES.glGetQueryObjectivEXT(id, pname, params);
@@ -980,6 +982,7 @@ void glGetQueryObjectiv(GLuint id, GLenum pname, GLint* params) {
 }
 
 void glGetQueryObjecti64v(GLuint id, GLenum pname, GLint64* params) {
+    ScopedHostContext __hostCtx;
     LOG()
     if (GLES.glGetQueryObjecti64vEXT) {
         GLES.glGetQueryObjecti64vEXT(id, pname, params);
