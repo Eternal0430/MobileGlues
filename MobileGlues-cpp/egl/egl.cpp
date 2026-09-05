@@ -14,7 +14,85 @@
 #include "../glx/lookup.h"
 #include "loader.h"
 
+#include <atomic>
+#include <mutex>
+
 #define DEBUG 0
+
+// ---------------------------------------------------------------------------
+// Recording the application's render target
+//
+// Every EGL entry point here is a passthrough, so the only way to know which
+// surface and context the application presents from is to watch the calls go
+// by. The fallback context in loader.cpp needs exactly that: a context bound to
+// a 32x32 pbuffer renders correctly and shows nothing.
+//
+// The writes happen during startup and the reads on whatever thread needs a
+// fallback, so the whole record sits behind one mutex.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::mutex g_target_mutex;
+AppRenderTarget g_target;
+std::atomic<unsigned> g_target_generation{0};
+
+} // namespace
+
+const AppRenderTarget& mg_egl_app_target() {
+    std::lock_guard<std::mutex> lock(g_target_mutex);
+    return g_target;
+}
+
+unsigned mg_egl_app_target_generation() {
+    return g_target_generation.load(std::memory_order_acquire);
+}
+
+void mg_egl_note_window_surface(EGLDisplay dpy, EGLConfig config, EGLSurface surface) {
+    if (surface == EGL_NO_SURFACE) return;
+    std::lock_guard<std::mutex> lock(g_target_mutex);
+    if (g_target.have_surface) return;  // first window surface wins; later ones
+                                        // are resize/recreate churn that would
+                                        // only replace a good target with a
+                                        // temporarily unusable one
+    g_target.display = dpy;
+    g_target.config = config;
+    g_target.draw_surface = surface;
+    g_target.read_surface = surface;
+    g_target.have_surface = true;
+    g_target_generation.fetch_add(1, std::memory_order_acq_rel);
+    LOG_W_FORCE("eglCreateWindowSurface: recorded the application's window surface=%p config=%p", surface, config);
+}
+
+void mg_egl_note_make_current(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx, EGLBoolean ok) {
+    if (ok != EGL_TRUE || ctx == EGL_NO_CONTEXT) return;
+    std::lock_guard<std::mutex> lock(g_target_mutex);
+    if (g_target.have_binding) return;  // the first successful bind is the
+                                        // application's render thread; later
+                                        // binds are our own fallbacks
+    g_target.display = dpy;
+    g_target.draw_surface = draw;
+    g_target.read_surface = read;
+    g_target.context = ctx;
+    g_target.have_binding = true;
+    g_target_generation.fetch_add(1, std::memory_order_acq_rel);
+    LOG_W_FORCE("eglMakeCurrent: recorded the application's binding surface=%p ctx=%p (thread %lu)", draw, ctx,
+                (unsigned long)pthread_self());
+
+    if (draw == EGL_NO_SURFACE) {
+        LOG_W_FORCE("eglMakeCurrent: the application bound a context with NO SURFACE — it cannot present. "
+                    "Drawing will go nowhere unless a surface is bound later.");
+    }
+}
+
+void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok) {
+    std::lock_guard<std::mutex> lock(g_target_mutex);
+    const bool matches = g_target.have_surface && surface == g_target.draw_surface;
+    if (!matches || ok != EGL_TRUE) {
+        LOG_W_FORCE("eglSwapBuffers: surface=%p ok=%d — this is %s the recorded window surface (%p). If the "
+                    "fallback context has no surface bound, every frame is presented from an empty surface.",
+                    surface, (int)ok, matches ? "INDEED" : "NOT", g_target.draw_surface);
+    }
+}
 
 extern "C"
 {
@@ -76,7 +154,9 @@ extern "C"
                                               const EGLint* attrib_list) {
         LOG_D("eglCreateWindowSurface, dpy: %p, config: %p, win: %p, attrib_list: %p", dpy, config, win, attrib_list);
         LOAD_EGL(eglCreateWindowSurface)
-        return egl_eglCreateWindowSurface(dpy, config, win, attrib_list);
+        EGLSurface surf = egl_eglCreateWindowSurface(dpy, config, win, attrib_list);
+        mg_egl_note_window_surface(dpy, config, surf);
+        return surf;
     }
 
     EGL_API EGLSurface eglCreatePbufferSurface(EGLDisplay dpy, EGLConfig config, const EGLint* attrib_list) {
@@ -181,7 +261,9 @@ extern "C"
     EGL_API EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
         LOG_D("eglMakeCurrent, dpy: %p, draw: %p, read: %p, ctx: %p", dpy, draw, read, ctx);
         LOAD_EGL(eglMakeCurrent)
-        return egl_eglMakeCurrent(dpy, draw, read, ctx);
+        EGLBoolean ok = egl_eglMakeCurrent(dpy, draw, read, ctx);
+        mg_egl_note_make_current(dpy, draw, read, ctx, ok);
+        return ok;
     }
 
     EGL_API EGLContext eglGetCurrentContext(void) {
@@ -231,6 +313,7 @@ extern "C"
         } else {
             result = egl_eglSwapBuffers(dpy, surface);
         }
+        mg_egl_note_swap(dpy, surface, result);
         return result;
     }
 

@@ -229,6 +229,47 @@ private:
     bool bound_;
 };
 
+// ---------------------------------------------------------------------------
+// The application's real render target
+//
+// A pbuffer context is fine for answering a query, but not for drawing: nothing
+// rendered into a 32x32 off-screen pbuffer can ever reach the screen, and
+// eglSwapBuffers(windowSurface) has nothing to present because the draw calls
+// never went to that surface. That is a black screen with working audio — the
+// game runs, the pipeline is alive, only the pixels go nowhere.
+//
+// So the fallback needs the surface the application actually presents from.
+// These are filled in by egl.cpp, which sees every EGL call the application
+// makes, and read by BindFallbackEGLContextIfNeeded().
+// ---------------------------------------------------------------------------
+
+struct AppRenderTarget {
+    EGLDisplay display = EGL_NO_DISPLAY;
+    EGLSurface draw_surface = EGL_NO_SURFACE;
+    EGLSurface read_surface = EGL_NO_SURFACE;
+    EGLContext context = EGL_NO_CONTEXT;
+    EGLConfig config = nullptr;
+    bool have_surface = false;  // a window surface was created
+    bool have_binding = false;  // a context was successfully made current
+};
+
+// Called from eglCreateWindowSurface: records the surface and the config that
+// produced it, since a companion context must be created from a matching config.
+void mg_egl_note_window_surface(EGLDisplay dpy, EGLConfig config, EGLSurface surface);
+
+// Called from eglMakeCurrent after the host returns.
+void mg_egl_note_make_current(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx, EGLBoolean ok);
+
+// Called from eglSwapBuffers, for diagnostics.
+void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok);
+
+const AppRenderTarget& mg_egl_app_target();
+
+// Bumped every time the record above changes, so a thread holding an off-screen
+// fallback can notice that a real window surface has appeared and switch to it.
+// Read on every guarded GL call, so it is an atomic load and nothing more.
+unsigned mg_egl_app_target_generation();
+
 #endif // __cplusplus
 
 #endif // FOLD_CRAFT_LAUNCHER_EGL_LOADER_H
