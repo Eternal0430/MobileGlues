@@ -601,6 +601,45 @@ static GLenum get_binding_for_target(GLenum target) {
 // Convenience macro: get texture object from bound target
 // ============================================================================
 
+// Forward declaration: defined below with the rest of the tracked-binding
+// helpers, which sit after the texture-unit tables this function needs.
+static inline GLuint* get_tracked_binding(GLenum target, int unit);
+
+// Repairs an empty binding slot.
+//
+// Two independent records describe "what is bound to this target on this
+// unit": g_tracked_*_binding (a plain GLuint per unit/target, consulted by
+// glBindTexture's fast path) and TextureBindingSlot::m_boundObject (the
+// TextureObject the rest of this file works with). glBindTexture updates both,
+// but its fast path returns early on the strength of the first alone — so once
+// the two drift apart, the slot is never repaired and every later
+// glTexImage2D / glTexSubImage2D dereferences a null `tex`. That is the
+// SIGSEGV at glTexImage2D+0x1a8 with si_addr=0x0.
+//
+// Recovering from the tracked id keeps the upload working instead of returning
+// early, and the log line records that a drift happened at all.
+static TextureObject* RecoverMissingTextureBinding(GLenum target, TextureTarget targetR, int unit, const char* func) {
+    GLuint* tracked = get_tracked_binding(target, unit);
+    const GLuint id = tracked ? *tracked : 0u;
+
+    if (id == 0) {
+        LOG_E("%s: nothing is bound to %s on texture unit %d — the binding slot is empty and no id is tracked, "
+              "so the texture state update is skipped. The GL call still goes through to the host.",
+              func, glEnumToString(target), unit);
+        return nullptr;
+    }
+
+    LOG_W("%s: binding slot for %s on texture unit %d was empty, but %u is tracked as bound — recovering. "
+          "The tracked-id cache and the TextureObject slot had drifted apart.",
+          func, glEnumToString(target), unit, id);
+
+    TextureObject* obj = GetOrCreateTextureObject(id);
+    if (!obj) return nullptr;
+    obj->target = targetR;
+    GetTextureUnit(unit).GetBindingSlot(targetR).Bind(obj);
+    return obj;
+}
+
 #define GET_TEXTURE_OBJECT(target)                                                                                     \
     unsigned __currentUnitIndex = GetCurrentTextureUnitIndex();                                                        \
     auto& __currentUnit = GetTextureUnit(__currentUnitIndex);                                                          \
@@ -610,7 +649,11 @@ static GLenum get_binding_for_target(GLenum target) {
         return;                                                                                                        \
     }                                                                                                                  \
     auto& __bindingSlot = __currentUnit.GetBindingSlot(targetR);                                                       \
-    auto tex = __bindingSlot.GetBoundObject()
+    auto tex = __bindingSlot.GetBoundObject();                                                                         \
+    if (!tex) [[unlikely]] {                                                                                           \
+        tex = RecoverMissingTextureBinding(target, targetR, (int)__currentUnitIndex, __func__);                        \
+        if (!tex) return;                                                                                              \
+    }
 
 // ============================================================================
 // BGRA / packed-type CPU swizzle helpers for the upload (unpack) path.
@@ -1070,7 +1113,25 @@ void glBindTexture(GLenum target, GLuint texture) {
     if (is_tracked_target(target)) {
         GLuint* tracked = get_tracked_binding(target, currentUnitIndex);
         if (tracked && *tracked == texture) [[likely]] {
-            return;
+            // The fast path trusts g_tracked_* alone, but that is only one of
+            // two records: TextureBindingSlot also has to hold the matching
+            // TextureObject, and it is the one the rest of this file reads. If
+            // they have drifted apart, returning here would leave the slot
+            // empty forever — and the next glTexImage2D would dereference a
+            // null `tex`. Verify both before skipping, and fall through to the
+            // full bind when they disagree so the slot gets repaired.
+            const auto targetR = ConvertGLEnumToTextureTarget(target);
+            if (targetR == TextureTarget::UNKNWON) return;
+
+            TextureObject* bound = GetTextureUnit(currentUnitIndex).GetBindingSlot(targetR).GetBoundObject();
+            const bool consistent =
+                (texture == 0) ? (bound == nullptr) : (bound != nullptr && bound->texture == texture);
+            if (consistent) return;
+
+            LOG_W("glBindTexture(%s, %u): fast path skipped — %u is tracked as bound but the slot holds %s. "
+                  "Rebinding to repair the drift.",
+                  glEnumToString(target), texture, texture,
+                  bound ? std::to_string(bound->texture).c_str() : "nothing");
         }
     }
 
