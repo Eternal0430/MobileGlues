@@ -98,6 +98,7 @@ void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok) {
         const bool first = !g_target.have_presenting;
         g_target.presenting_surface = surface;
         g_target.have_presenting = true;
+        g_target.presenting_thread = pthread_self();
         g_target.display = dpy;
         if (!g_target.have_surface) {
             g_target.draw_surface = surface;
@@ -105,8 +106,18 @@ void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok) {
             g_target.have_surface = true;
         }
         g_target_generation.fetch_add(1, std::memory_order_acq_rel);
-        LOG_W_FORCE("eglSwapBuffers: this is the surface the application presents from: %p%s", surface,
-                    first ? "" : " (changed from the previous one)");
+        LOG_W_FORCE("eglSwapBuffers: this is the surface the application presents from: %p, presented by "
+                    "pthread=%lu%s",
+                    surface, (unsigned long)pthread_self(), first ? "" : " (changed from the previous one)");
+    } else if (g_target.presenting_thread != 0 && !pthread_equal(g_target.presenting_thread, pthread_self())) {
+        // Worth reporting: if the presenting thread moves, the render thread
+        // inferred from the first swap is no longer the one that matters.
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            LOG_W_FORCE("eglSwapBuffers: surface %p is being presented from pthread=%lu, but the first swap was "
+                        "made by pthread=%lu",
+                        surface, (unsigned long)pthread_self(), (unsigned long)g_target.presenting_thread);
+        }
     }
 }
 

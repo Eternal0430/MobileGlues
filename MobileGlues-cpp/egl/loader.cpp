@@ -232,8 +232,9 @@ const char* CurrentThreadLabel() {
     return label;
 }
 
-// Creates a context for this thread and binds it with no surface.
-bool CreateThreadContext(EGLDisplay dpy, EGLContext share) {
+// Creates a context for this thread and binds it to `surf` (EGL_NO_SURFACE for
+// surfaceless).
+bool CreateThreadContext(EGLDisplay dpy, EGLContext share, EGLSurface surf) {
     LOAD_EGL(eglCreateContext);
     LOAD_EGL(eglDestroyContext);
     LOAD_EGL(eglMakeCurrent);
@@ -251,15 +252,33 @@ bool CreateThreadContext(EGLDisplay dpy, EGLContext share) {
     for (const EGLint* attrs : candidates) {
         EGLContext ctx = egl_eglCreateContext(dpy, g_context_config, share, attrs);
         if (ctx == EGL_NO_CONTEXT) continue;
-        if (egl_eglMakeCurrent(dpy, kNoSurface, kNoSurface, ctx) != EGL_TRUE) {
+        if (egl_eglMakeCurrent(dpy, surf, surf, ctx) != EGL_TRUE) {
             egl_eglGetError();
             if (egl_eglDestroyContext) egl_eglDestroyContext(dpy, ctx);
             continue;
         }
         t_fb.ctx = ctx;
         t_fb.share_with = share;
+        t_fb.bound_surface = surf;
         return true;
     }
+    return false;
+}
+
+// One binding attempt, reported either way.
+//
+// Every previous design failed with no record of why. The application's context
+// is refused for reasons that differ per device and per thread, and guessing
+// cost five iterations; printing the EGL error turns the next run into an
+// answer instead of another hypothesis.
+bool TryBind(EGLDisplay dpy, EGLContext ctx, EGLSurface surf, const char* what) {
+    LOAD_EGL(eglMakeCurrent);
+    LOAD_EGL(eglGetError);
+    if (egl_eglMakeCurrent(dpy, surf, surf, ctx) == EGL_TRUE) {
+        LOG_W_FORCE("BindFallbackEGLContext: [%s] %s: bound", CurrentThreadLabel(), what);
+        return true;
+    }
+    LOG_W_FORCE("BindFallbackEGLContext: [%s] %s: FAILED (0x%x)", CurrentThreadLabel(), what, egl_eglGetError());
     return false;
 }
 
@@ -269,6 +288,8 @@ bool BindFallbackEGLContextIfNeeded() {
     if (!g_fallback_context_ready) return false;
 
     LOAD_EGL(eglGetCurrentContext);
+    LOAD_EGL(eglGetCurrentSurface);
+    LOAD_EGL(eglGetCurrentDisplay);
     LOAD_EGL(eglMakeCurrent);
     LOAD_EGL(eglDestroyContext);
     LOAD_EGL(eglGetError);
@@ -280,27 +301,53 @@ bool BindFallbackEGLContextIfNeeded() {
         t_seen_generation = gen;
         const AppRenderTarget& t = mg_egl_app_target();
 
-        // Correct the surface on a thread already holding the application's
-        // context. The first binding necessarily uses a guess: the presenting
-        // surface is only discoverable from eglSwapBuffers, which has not run
-        // yet at that point. Without this correction the thread would keep
-        // drawing into the surface it guessed while another one is presented —
-        // a frozen picture with the game loop running perfectly well.
-        if (t_fb.using_app_context && t.have_presenting && t.presenting_surface != EGL_NO_SURFACE &&
-            t_fb.bound_surface != t.presenting_surface && t.context != EGL_NO_CONTEXT) {
-            if (egl_eglMakeCurrent(t.display, t.presenting_surface, t.presenting_surface, t.context) == EGL_TRUE) {
-                LOG_W_FORCE("BindFallbackEGLContext: [%s] moved the application's context onto the surface it "
-                            "actually presents from (%p, was %p) — drawing here reaches the screen",
-                            CurrentThreadLabel(), t.presenting_surface, t_fb.bound_surface);
+        // Move onto the surface that is actually being presented, once it is
+        // known. Only the thread that calls eglSwapBuffers does this: a surface
+        // may be current for one context at a time, so letting a worker take it
+        // would block the very thread the picture depends on.
+        //
+        // The first binding can only ever be a guess, because the presenting
+        // surface is not observable until eglSwapBuffers runs. Without this
+        // correction a thread keeps drawing into whatever it guessed while
+        // another surface is shown — a frozen picture with the game loop, audio
+        // and input all running normally.
+        const bool is_presenting_thread = t.have_presenting && t.presenting_thread != 0 &&
+                                          pthread_equal(t.presenting_thread, pthread_self()) != 0;
+        if (is_presenting_thread && t.presenting_surface != EGL_NO_SURFACE && t_fb.ctx != EGL_NO_CONTEXT &&
+            t_fb.bound_surface != t.presenting_surface) {
+            if (TryBind(t.display, t_fb.ctx, t.presenting_surface, "move onto the presenting surface")) {
+                LOG_W_FORCE("BindFallbackEGLContext: [%s] now bound to the presenting surface %p, so drawing here "
+                            "reaches the screen",
+                            CurrentThreadLabel(), t.presenting_surface);
                 t_fb.bound_surface = t.presenting_surface;
+            } else if (t.have_binding && t.context != EGL_NO_CONTEXT) {
+                // Rebinding was refused — most likely the application's context
+                // is current on another thread. The presenting thread is the one
+                // thread that must not be left unable to draw, so give it a
+                // context of its own on the presenting surface, sharing with the
+                // application's so the game's objects stay visible.
+                const EGLContext old = t_fb.ctx;
+                t_fb.ctx = EGL_NO_CONTEXT;
+                if (CreateThreadContext(t.display, t.context, t.presenting_surface)) {
+                    if (egl_eglDestroyContext && old != eglContext) egl_eglDestroyContext(t.display, old);
+                    LOG_W_FORCE("BindFallbackEGLContext: [%s] could not rebind the application's context, so this "
+                                "thread was given a new one on the presenting surface %p — drawing here reaches "
+                                "the screen",
+                                CurrentThreadLabel(), t.presenting_surface);
+                } else {
+                    // Restore: losing the context entirely would be worse.
+                    t_fb.ctx = old;
+                    egl_eglMakeCurrent(t.display, t_fb.bound_surface, t_fb.bound_surface, old);
+                }
             }
         }
 
         if (!t_fb.using_app_context && t.have_binding && t.context != EGL_NO_CONTEXT &&
             t_fb.ctx != EGL_NO_CONTEXT && t_fb.ctx != eglContext && t_fb.share_with != t.context) {
             const EGLContext old = t_fb.ctx;
+            const EGLSurface old_surf = t_fb.bound_surface;
             t_fb.ctx = EGL_NO_CONTEXT;
-            if (CreateThreadContext(t.display, t.context)) {
+            if (CreateThreadContext(t.display, t.context, old_surf)) {
                 if (egl_eglDestroyContext) egl_eglDestroyContext(eglDisplay, old);
                 LOG_W_FORCE("BindFallbackEGLContext: [%s] rebuilt this thread's context to share with the "
                             "application's context %p. It was created before that context existed, so anything "
@@ -322,59 +369,76 @@ bool BindFallbackEGLContextIfNeeded() {
     const AppRenderTarget& t = mg_egl_app_target();
     const bool have_app = t.have_binding && t.context != EGL_NO_CONTEXT;
     const bool have_presenting = t.have_presenting && t.presenting_surface != EGL_NO_SURFACE;
+    const bool have_recorded = t.have_surface && t.draw_surface != EGL_NO_SURFACE;
+    const EGLDisplay dpy = have_app ? t.display : eglDisplay;
 
-    // First choice, and it matters more than everything below: put the
-    // application's own context back on the surface it presents from.
-    //
-    // This is what a render thread needs. It arrives here because the
-    // application bound this context, then unbound it, then issued GL calls —
-    // measured on real hardware, where eglMakeCurrent recorded ctx=... on
-    // pthread=N and the very next log line has that same pthread=N reporting no
-    // current context. Handing that thread a fresh surfaceless context instead
-    // is what froze the picture: every draw call succeeded, no pixel reached the
-    // presenting surface, eglSwapBuffers kept presenting the same stale frame
-    // 1251 times while audio and input carried on normally.
-    //
-    // Binding the application's context also happens to be the ideal fallback
-    // for any other thread: it is the context the game's objects live in, and it
-    // is the only one that can present. It is tried first and simply fails,
-    // without side effects, when another thread already holds the context.
-    if (have_app) {
-        const bool use_surface = have_presenting || (t.have_surface && t.draw_surface != EGL_NO_SURFACE);
-        const EGLSurface surf = have_presenting ? t.presenting_surface : t.draw_surface;
-        if (use_surface && egl_eglMakeCurrent(t.display, surf, surf, t.context) == EGL_TRUE) {
-            t_fb.ctx = t.context;
-            t_fb.share_with = t.context;
-            t_fb.using_app_context = true;
-            t_fb.bound_surface = surf;
-            LOG_W_FORCE("BindFallbackEGLContext: [%s] re bound the application's own context %p to the surface it "
-                        "presents from (%p), so this thread can draw and present",
-                        CurrentThreadLabel(), t.context, surf);
-            return true;
-        }
+    // Everything needed to explain a refusal, in one line. Five designs were
+    // built on guesses about these values; this prints them.
+    LOG_W_FORCE("BindFallbackEGLContext: [%s] no current context. this thread: ctx=%p draw=%p dpy=%p | recorded "
+                "app: dpy=%p ctx=%p draw=%p presenting=%p",
+                CurrentThreadLabel(), egl_eglGetCurrentContext(), egl_eglGetCurrentSurface(EGL_DRAW),
+                egl_eglGetCurrentDisplay(), t.display, t.context, t.draw_surface, t.presenting_surface);
+
+    const bool can_use_presenting =
+        have_presenting && t.presenting_thread != 0 && pthread_equal(t.presenting_thread, pthread_self()) != 0;
+
+    // 1. The application's own context on the presenting surface. This is what a
+    //    render thread needs: it is the context the game's objects live in and
+    //    the only one that can present.
+    if (have_app && can_use_presenting &&
+        TryBind(dpy, t.context, t.presenting_surface, "app context + presenting surface")) {
+        t_fb.ctx = t.context;
+        t_fb.share_with = t.context;
+        t_fb.using_app_context = true;
+        t_fb.bound_surface = t.presenting_surface;
+        return true;
     }
 
-    const EGLDisplay dpy = have_app ? t.display : eglDisplay;
-    const EGLContext share = have_app ? t.context : EGL_NO_CONTEXT;
+    // 2. The application's context on the window surface recorded at creation.
+    if (have_app && have_recorded && (!have_presenting || t.draw_surface != t.presenting_surface) &&
+        TryBind(dpy, t.context, t.draw_surface, "app context + recorded window surface")) {
+        t_fb.ctx = t.context;
+        t_fb.share_with = t.context;
+        t_fb.using_app_context = true;
+        t_fb.bound_surface = t.draw_surface;
+        return true;
+    }
 
-    if (CreateThreadContext(dpy, share)) {
-        LOG_W_FORCE("BindFallbackEGLContext: [%s] this thread had no current EGL context, so MobileGLES gave it "
-                    "one of its own%s, bound with no surface. It cannot present — only the thread holding the "
-                    "application's context can — but objects it creates are visible to the game.",
+    // 3. The application's context, surfaceless. Queries and compiles work;
+    //    drawing does not, but it is better than nothing and it is corrected
+    //    later by the presenting-surface logic above.
+    if (have_app && TryBind(dpy, t.context, kNoSurface, "app context surfaceless")) {
+        t_fb.ctx = t.context;
+        t_fb.share_with = t.context;
+        t_fb.using_app_context = true;
+        t_fb.bound_surface = kNoSurface;
+        return true;
+    }
+
+    // 4/5. A context of this thread's own, sharing with the application's so
+    //      that objects it creates are visible to the game. Only the presenting
+    //      thread binds it to the presenting surface.
+    const EGLContext share = have_app ? t.context : EGL_NO_CONTEXT;
+    if (can_use_presenting && CreateThreadContext(dpy, share, t.presenting_surface)) {
+        LOG_W_FORCE("BindFallbackEGLContext: [%s] gave this thread a context of its own on the presenting surface "
+                    "%p, so drawing here reaches the screen",
+                    CurrentThreadLabel(), t.presenting_surface);
+        return true;
+    }
+    if (CreateThreadContext(dpy, share, kNoSurface)) {
+        LOG_W_FORCE("BindFallbackEGLContext: [%s] gave this thread a context of its own%s, surfaceless. It cannot "
+                    "present, but objects it creates are visible to the game",
                     CurrentThreadLabel(), have_app ? " sharing with the application's context" : "");
         return true;
     }
 
     // Last resort: the startup context. It shares with nothing, so it is only
     // good for queries, and it is one object — a second thread will be refused.
-    if (eglContext != EGL_NO_CONTEXT &&
-        egl_eglMakeCurrent(eglDisplay, kNoSurface, kNoSurface, eglContext) == EGL_TRUE) {
+    if (eglContext != EGL_NO_CONTEXT && TryBind(eglDisplay, eglContext, kNoSurface, "startup context surfaceless")) {
         t_fb.ctx = eglContext;
         t_fb.share_with = EGL_NO_CONTEXT;
-        LOG_W_FORCE("BindFallbackEGLContext: [%s] could not create a context for this thread; using the startup "
-                    "context, which shares with nothing. Objects created here are invisible to the game, and "
-                    "other threads will be refused it",
-                    CurrentThreadLabel());
+        t_fb.using_app_context = false;
+        t_fb.bound_surface = kNoSurface;
         return true;
     }
 

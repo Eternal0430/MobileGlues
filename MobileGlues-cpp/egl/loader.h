@@ -8,6 +8,11 @@
 #ifndef FOLD_CRAFT_LAUNCHER_EGL_LOADER_H
 #define FOLD_CRAFT_LAUNCHER_EGL_LOADER_H
 
+// Needed unconditionally: AppRenderTarget below identifies the presenting
+// thread, and it is declared inside the extern "C" block's translation unit in
+// some consumers too.
+#include <pthread.h>
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -267,6 +272,12 @@ struct AppRenderTarget {
     // go to a surface that is never presented.
     EGLSurface presenting_surface = EGL_NO_SURFACE;
     bool have_presenting = false;
+
+    // The thread that calls eglSwapBuffers, i.e. the render thread. Recorded so
+    // that only it binds to the presenting surface: a surface may be current for
+    // one context at a time, and a worker thread taking it would block the very
+    // thread the picture depends on.
+    pthread_t presenting_thread = 0;
 };
 
 // Called from eglCreateWindowSurface: records the surface the application
