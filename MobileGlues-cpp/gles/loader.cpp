@@ -161,6 +161,87 @@ void LogOpenGLExtensions() {
 
 struct gles_caps_t g_gles_caps;
 
+// =============================================================================
+// Persistent mapping probe
+// =============================================================================
+namespace {
+
+// Minecraft 26.3 maps its dynamic uniform buffers with these exact flags:
+//     storage: GlConst.bufferUsageToGlFlag(130) = WRITE|PERSISTENT|COHERENT
+//     mapping: GlBuffer$Direct builds 34 | 192
+//              = WRITE|UNSYNCHRONIZED|PERSISTENT|COHERENT
+//
+// Advertising GL_ARB_buffer_storage is a promise that both work. Some drivers
+// — notably ported Mesa/turnip builds — publish the extension string and
+// resolve every entry point, then still refuse the mapping. That only surfaces
+// much later as "IllegalStateException: Failed to map buffer", long after the
+// evidence is gone, and with no GL error in between.
+//
+// So ask the driver directly, once, at start-up: allocate a throwaway buffer
+// the way the game does and map it the way the game does. The answer decides
+// whether the extension is advertised at all.
+//
+// The numbers are written out rather than spelled with GL_ names because the
+// mapping flags the game uses are not a combination any header defines.
+constexpr GLbitfield kProbeStorageFlags = 0xC2; // WRITE|PERSISTENT|COHERENT
+constexpr GLbitfield kProbeMappingFlags = 0xE2; // ... plus UNSYNCHRONIZED
+constexpr GLsizeiptr kProbeSize = 4096;
+
+struct PersistentProbe {
+    bool ran = false;
+    bool storageOk = false;
+    GLenum storageErr = GL_NO_ERROR;
+    bool mapAsGameOk = false;   // exactly what the game asks for
+    bool mapRepairedOk = false; // with UNSYNCHRONIZED stripped
+    GLenum mapErr = GL_NO_ERROR;
+};
+
+PersistentProbe ProbePersistentMapping() {
+    PersistentProbe probe;
+
+    if (!GLES.glGenBuffers || !GLES.glBindBuffer || !GLES.glDeleteBuffers || !GLES.glBufferStorageEXT ||
+        !GLES.glMapBufferRange || !GLES.glUnmapBuffer || !GLES.glGetError || !GLES.glGetIntegerv)
+        return probe;
+
+    GLuint buffer = 0;
+    GLES.glGenBuffers(1, &buffer);
+    if (buffer == 0) return probe;
+
+    GLint previous = 0;
+    GLES.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &previous);
+    GLES.glBindBuffer(GL_ARRAY_BUFFER, buffer);
+    while (GLES.glGetError() != GL_NO_ERROR) {
+    }
+
+    GLES.glBufferStorageEXT(GL_ARRAY_BUFFER, kProbeSize, nullptr, kProbeStorageFlags);
+    probe.storageErr = GLES.glGetError();
+    probe.storageOk = (probe.storageErr == GL_NO_ERROR);
+    probe.ran = true;
+
+    if (probe.storageOk) {
+        void* ptr = GLES.glMapBufferRange(GL_ARRAY_BUFFER, 0, kProbeSize, kProbeMappingFlags);
+        probe.mapErr = GLES.glGetError();
+        probe.mapAsGameOk = (ptr != nullptr);
+        if (ptr) {
+            GLES.glUnmapBuffer(GL_ARRAY_BUFFER);
+        } else {
+            // The same retry glMapBufferRange() performs on the real path.
+            ptr = GLES.glMapBufferRange(GL_ARRAY_BUFFER, 0, kProbeSize, kProbeStorageFlags);
+            probe.mapErr = GLES.glGetError();
+            probe.mapRepairedOk = (ptr != nullptr);
+            if (ptr) GLES.glUnmapBuffer(GL_ARRAY_BUFFER);
+        }
+    }
+
+    GLES.glBindBuffer(GL_ARRAY_BUFFER, (GLuint)previous);
+    GLES.glDeleteBuffers(1, &buffer);
+    while (GLES.glGetError() != GL_NO_ERROR) {
+    }
+    return probe;
+}
+
+} // namespace
+
 void InitGLESCapabilities() {
     memset(&g_gles_caps, 0, sizeof(struct gles_caps_t));
 
@@ -263,26 +344,38 @@ void InitGLESCapabilities() {
 
     // ---- Map optional ES extensions to desktop GL extensions ----
 
-    // Advertise ARB_buffer_storage only when the driver both claims the
-    // extension and actually handed us the entry point. Those two are
-    // independent: the string comes from glGetStringi, the pointer from
-    // eglGetProcAddress, and a driver (notably ported Mesa builds on Android)
-    // can advertise GL_EXT_buffer_storage while resolving glBufferStorageEXT
-    // to nothing.
-    //
-    // Advertising it anyway is what makes Minecraft choose its immutable
-    // buffer path: glBufferStorage silently does nothing, the buffer keeps no
-    // storage, and the first glMapBufferRange returns NULL — surfacing as
-    // "IllegalStateException: Failed to map buffer" during
-    // RenderSystem.initRenderer, with no GL error in between.
+    // Advertise ARB_buffer_storage only when the driver can actually back it
+    // up. Three things have to hold, and they are independent of each other:
+    //   1. the extension string (from glGetStringi)
+    //   2. the entry point (from eglGetProcAddress)
+    //   3. a working persistent mapping (proven, not assumed)
+    // Failing 1 or 2 makes glBufferStorage a silent no-op: no storage, no GL
+    // error. Failing 3 does allocate the storage but leaves the first
+    // glMapBufferRange returning NULL. Either way the game dies in
+    // RenderSystem.initRenderer with "Failed to map buffer".
     LOG_I("%sDetected GL_EXT_buffer_storage! (glBufferStorageEXT %s)",
           g_gles_caps.GL_EXT_buffer_storage ? "" : "Not ", GLES.glBufferStorageEXT ? "resolved" : "MISSING")
+
+    const bool haveStorageExt = g_gles_caps.GL_EXT_buffer_storage && GLES.glBufferStorageEXT;
     if (g_gles_caps.GL_EXT_buffer_storage && !GLES.glBufferStorageEXT) {
         LOG_W_FORCE("GL_EXT_buffer_storage is advertised but glBufferStorageEXT could not be resolved; "
                     "withholding GL_ARB_buffer_storage so callers use mutable buffers")
-    }
-    if (g_gles_caps.GL_EXT_buffer_storage && GLES.glBufferStorageEXT) {
-        AppendExtension("GL_ARB_buffer_storage");
+    } else if (haveStorageExt) {
+        const PersistentProbe probe = ProbePersistentMapping();
+        LOG_I("Persistent map probe: ran=%d storage=%s(0x%x) mapAsGame=%s mapRepaired=%s glError=0x%x", probe.ran,
+              probe.storageOk ? "ok" : "FAILED", probe.storageErr, probe.mapAsGameOk ? "ok" : "FAILED",
+              probe.mapRepairedOk ? "ok" : "FAILED", probe.mapErr)
+
+        if (probe.mapAsGameOk || probe.mapRepairedOk) {
+            if (!probe.mapAsGameOk && probe.mapRepairedOk) {
+                LOG_I("Persistent mapping needs UNSYNCHRONIZED stripped; buffer.cpp already does this")
+            }
+            AppendExtension("GL_ARB_buffer_storage");
+        } else {
+            LOG_W_FORCE("Persistent mapping is unusable here (storage %s, both map attempts failed, glError=0x%x); "
+                        "withholding GL_ARB_buffer_storage so the game allocates mutable buffers",
+                        probe.storageOk ? "ok" : "FAILED", probe.mapErr)
+        }
     }
 
     if (g_gles_caps.EXT_disjoint_timer_query && global_settings.ext_timer_query) {

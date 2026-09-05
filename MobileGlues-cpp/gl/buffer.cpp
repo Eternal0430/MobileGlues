@@ -990,6 +990,22 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
             ((flags & GL_MAP_PERSISTENT_BIT) != 0 || (flags & GL_DYNAMIC_STORAGE_BIT) != 0))
             flags |= (GL_MAP_WRITE_BIT | GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT);
         GLES.glBufferStorageEXT(target, size, data, flags);
+
+        // CHECK_GL_ERROR compiles to nothing in release builds, so a rejected
+        // allocation would leave the buffer with no storage and leave no trace
+        // at all — the caller only finds out later, when glMapBufferRange
+        // returns NULL. Report the first rejection here.
+        if (GLES.glGetError) {
+            static bool storage_warned_once = false;
+            const GLenum err = GLES.glGetError();
+            if (err != GL_NO_ERROR && !storage_warned_once) {
+                storage_warned_once = true;
+                LOG_W_FORCE("glBufferStorage was rejected: target=%s(0x%x) size=%lld flags=0x%x glError=0x%x — the "
+                            "buffer has no storage, so a later glMapBufferRange will return NULL",
+                            glEnumToString(target), target, (long long)size, flags, err);
+            }
+        }
+
         // Mirror glBufferData: keep the PBO CPU shadow in sync so the BGRA
         // swizzle in texture.cpp can read from CPU memory instead of mapping
         // the (immutable, possibly non-DYNAMIC_STORAGE) GLES buffer for read.
