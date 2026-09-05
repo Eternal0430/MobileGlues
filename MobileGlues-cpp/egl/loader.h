@@ -254,6 +254,19 @@ struct AppRenderTarget {
     EGLConfig config = nullptr;
     bool have_surface = false;  // a window surface was created
     bool have_binding = false;  // a context was successfully made current
+
+    // The surface the application actually presents from, observed in
+    // eglSwapBuffers. This is the only reliable way to identify it: on real
+    // hardware it was NOT the surface reported by eglCreateWindowSurface.
+    // A session logged one recorded window surface (0x77c45f3d80) and then
+    // 1251 swaps against a different one (0x7806563d80), because the surface
+    // that ends up on screen is created by a call this library does not
+    // intercept — eglCreatePlatformWindowSurface is not exported here.
+    //
+    // Anything bound for drawing must be bound to this surface, or the pixels
+    // go to a surface that is never presented.
+    EGLSurface presenting_surface = EGL_NO_SURFACE;
+    bool have_presenting = false;
 };
 
 // Called from eglCreateWindowSurface: records the surface the application

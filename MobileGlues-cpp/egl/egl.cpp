@@ -85,12 +85,28 @@ void mg_egl_note_make_current(EGLDisplay dpy, EGLSurface draw, EGLSurface read, 
 }
 
 void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok) {
+    if (ok != EGL_TRUE || surface == EGL_NO_SURFACE) return;
+
     std::lock_guard<std::mutex> lock(g_target_mutex);
-    const bool matches = g_target.have_surface && surface == g_target.draw_surface;
-    if (!matches || ok != EGL_TRUE) {
-        LOG_W_FORCE("eglSwapBuffers: surface=%p ok=%d — this is %s the recorded window surface (%p). If the "
-                    "fallback context has no surface bound, every frame is presented from an empty surface.",
-                    surface, (int)ok, matches ? "INDEED" : "NOT", g_target.draw_surface);
+
+    // This is the surface the application really presents from. Recording it
+    // here rather than in eglCreateWindowSurface is deliberate: the surface that
+    // reaches the screen is created by a call this library does not intercept
+    // (eglCreatePlatformWindowSurface), so the one recorded at creation time was
+    // a different, discarded surface.
+    if (!g_target.have_presenting || surface != g_target.presenting_surface) {
+        const bool first = !g_target.have_presenting;
+        g_target.presenting_surface = surface;
+        g_target.have_presenting = true;
+        g_target.display = dpy;
+        if (!g_target.have_surface) {
+            g_target.draw_surface = surface;
+            g_target.read_surface = surface;
+            g_target.have_surface = true;
+        }
+        g_target_generation.fetch_add(1, std::memory_order_acq_rel);
+        LOG_W_FORCE("eglSwapBuffers: this is the surface the application presents from: %p%s", surface,
+                    first ? "" : " (changed from the previous one)");
     }
 }
 
