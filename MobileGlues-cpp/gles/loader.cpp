@@ -166,34 +166,49 @@ struct gles_caps_t g_gles_caps;
 // =============================================================================
 namespace {
 
-// Minecraft 26.3 maps its dynamic uniform buffers with these exact flags:
-//     storage: GlConst.bufferUsageToGlFlag(130) = WRITE|PERSISTENT|COHERENT
+// Minecraft 26.3 maps its dynamic uniform buffers like this:
+//     target : GlUtil.selectBufferBindTarget(130) = 35345 = GL_UNIFORM_BUFFER
+//     storage: GlConst.bufferUsageToGlFlag(130)   = 0xC2 = WRITE|PERSISTENT|COHERENT
 //     mapping: GlBuffer$Direct builds 34 | 192
-//              = WRITE|UNSYNCHRONIZED|PERSISTENT|COHERENT
+//              = 0xE2 = WRITE|UNSYNCHRONIZED|PERSISTENT|COHERENT
+//     size   : roundToward(TRANSFORM_UBO_SIZE=160, 256) * capacity(2) = 512
 //
-// Advertising GL_ARB_buffer_storage is a promise that both work. Some drivers
-// — notably ported Mesa/turnip builds — publish the extension string and
-// resolve every entry point, then still refuse the mapping. That only surfaces
-// much later as "IllegalStateException: Failed to map buffer", long after the
-// evidence is gone, and with no GL error in between.
+// Advertising GL_ARB_buffer_storage promises all of that works. A driver can
+// publish the extension string and resolve every entry point and still refuse
+// the mapping — which only surfaces much later as "IllegalStateException:
+// Failed to map buffer", with no GL error in between and no surviving trace.
 //
-// So ask the driver directly, once, at start-up: allocate a throwaway buffer
-// the way the game does and map it the way the game does. The answer decides
-// whether the extension is advertised at all.
+// So ask the driver directly, once, at start-up, using the game's own target
+// and size. Every combination is tried independently rather than stopping at
+// the first success: the earlier probe only reported the first rung and left
+// the others as "FAILED", which made a working driver look broken.
 //
 // The numbers are written out rather than spelled with GL_ names because the
 // mapping flags the game uses are not a combination any header defines.
+constexpr GLenum kProbeTargets[] = {0x8892 /* GL_ARRAY_BUFFER */, 0x8A11 /* GL_UNIFORM_BUFFER */};
+constexpr const char* kProbeTargetNames[] = {"ARRAY_BUFFER", "UNIFORM_BUFFER"};
+constexpr int kProbeTargetCount = 2;
+
 constexpr GLbitfield kProbeStorageFlags = 0xC2; // WRITE|PERSISTENT|COHERENT
-constexpr GLbitfield kProbeMappingFlags = 0xE2; // ... plus UNSYNCHRONIZED
-constexpr GLsizeiptr kProbeSize = 4096;
+constexpr GLbitfield kProbeFlagSets[] = {
+    0xE2, // exactly what the game asks for
+    0xC2, // with UNSYNCHRONIZED stripped (what buffer.cpp sends)
+    0x02, // plain WRITE, no persistence at all
+};
+constexpr const char* kProbeFlagNames[] = {"E2", "C2", "W"};
+constexpr int kProbeFlagCount = 3;
+constexpr GLsizeiptr kProbeSize = 512; // the game's actual ring-buffer size
 
 struct PersistentProbe {
     bool ran = false;
-    bool storageOk = false;
-    GLenum storageErr = GL_NO_ERROR;
-    bool mapAsGameOk = false;   // exactly what the game asks for
-    bool mapRepairedOk = false; // with UNSYNCHRONIZED stripped
-    GLenum mapErr = GL_NO_ERROR;
+    bool storageOk[kProbeTargetCount] = {false, false};
+    GLenum storageErr[kProbeTargetCount] = {GL_NO_ERROR, GL_NO_ERROR};
+    bool mapOk[kProbeTargetCount][kProbeFlagCount] = {};
+    GLenum mapErr[kProbeTargetCount][kProbeFlagCount] = {};
+
+    // Whether persistent mapping (either flag set) works on the target the
+    // game actually uses. This is what decides the extension advertisement.
+    bool WorksOnGameTarget() const { return mapOk[1][0] || mapOk[1][1]; }
 };
 
 PersistentProbe ProbePersistentMapping() {
@@ -203,39 +218,58 @@ PersistentProbe ProbePersistentMapping() {
         !GLES.glMapBufferRange || !GLES.glUnmapBuffer || !GLES.glGetError || !GLES.glGetIntegerv)
         return probe;
 
-    GLuint buffer = 0;
-    GLES.glGenBuffers(1, &buffer);
-    if (buffer == 0) return probe;
-
-    GLint previous = 0;
-    GLES.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &previous);
-    GLES.glBindBuffer(GL_ARRAY_BUFFER, buffer);
-    while (GLES.glGetError() != GL_NO_ERROR) {
-    }
-
-    GLES.glBufferStorageEXT(GL_ARRAY_BUFFER, kProbeSize, nullptr, kProbeStorageFlags);
-    probe.storageErr = GLES.glGetError();
-    probe.storageOk = (probe.storageErr == GL_NO_ERROR);
     probe.ran = true;
 
-    if (probe.storageOk) {
-        void* ptr = GLES.glMapBufferRange(GL_ARRAY_BUFFER, 0, kProbeSize, kProbeMappingFlags);
-        probe.mapErr = GLES.glGetError();
-        probe.mapAsGameOk = (ptr != nullptr);
-        if (ptr) {
-            GLES.glUnmapBuffer(GL_ARRAY_BUFFER);
-        } else {
-            // The same retry glMapBufferRange() performs on the real path.
-            ptr = GLES.glMapBufferRange(GL_ARRAY_BUFFER, 0, kProbeSize, kProbeStorageFlags);
-            probe.mapErr = GLES.glGetError();
-            probe.mapRepairedOk = (ptr != nullptr);
-            if (ptr) GLES.glUnmapBuffer(GL_ARRAY_BUFFER);
-        }
-    }
+    for (int t = 0; t < kProbeTargetCount; ++t) {
+        const GLenum target = kProbeTargets[t];
 
-    GLES.glBindBuffer(GL_ARRAY_BUFFER, (GLuint)previous);
-    GLES.glDeleteBuffers(1, &buffer);
-    while (GLES.glGetError() != GL_NO_ERROR) {
+        GLuint buffer = 0;
+        GLES.glGenBuffers(1, &buffer);
+        if (buffer == 0) continue;
+
+        GLint previous = 0;
+        GLES.glGetIntegerv(target == 0x8892 ? GL_ARRAY_BUFFER_BINDING : 0x8A28 /* GL_UNIFORM_BUFFER_BINDING */,
+                           &previous);
+        GLES.glBindBuffer(target, buffer);
+        while (GLES.glGetError() != GL_NO_ERROR) {
+        }
+
+        GLES.glBufferStorageEXT(target, kProbeSize, nullptr, kProbeStorageFlags);
+        probe.storageErr[t] = GLES.glGetError();
+        probe.storageOk[t] = (probe.storageErr[t] == GL_NO_ERROR);
+        if (!probe.storageOk[t]) {
+            GLES.glBindBuffer(target, (GLuint)previous);
+            GLES.glDeleteBuffers(1, &buffer);
+            while (GLES.glGetError() != GL_NO_ERROR) {
+            }
+            continue;
+        }
+
+        for (int f = 0; f < kProbeFlagCount; ++f) {
+            // A fresh buffer per attempt: some drivers keep a buffer mapped
+            // after a failed call, which would poison every later attempt.
+            GLuint b = 0;
+            GLES.glGenBuffers(1, &b);
+            if (b == 0) continue;
+            GLES.glBindBuffer(target, b);
+            GLES.glBufferStorageEXT(target, kProbeSize, nullptr, kProbeStorageFlags);
+            while (GLES.glGetError() != GL_NO_ERROR) {
+            }
+
+            void* ptr = GLES.glMapBufferRange(target, 0, kProbeSize, kProbeFlagSets[f]);
+            probe.mapErr[t][f] = GLES.glGetError();
+            probe.mapOk[t][f] = (ptr != nullptr);
+            if (ptr) GLES.glUnmapBuffer(target);
+
+            GLES.glDeleteBuffers(1, &b);
+            while (GLES.glGetError() != GL_NO_ERROR) {
+            }
+        }
+
+        GLES.glBindBuffer(target, (GLuint)previous);
+        GLES.glDeleteBuffers(1, &buffer);
+        while (GLES.glGetError() != GL_NO_ERROR) {
+        }
     }
     return probe;
 }
@@ -362,19 +396,22 @@ void InitGLESCapabilities() {
                     "withholding GL_ARB_buffer_storage so callers use mutable buffers")
     } else if (haveStorageExt) {
         const PersistentProbe probe = ProbePersistentMapping();
-        LOG_I("Persistent map probe: ran=%d storage=%s(0x%x) mapAsGame=%s mapRepaired=%s glError=0x%x", probe.ran,
-              probe.storageOk ? "ok" : "FAILED", probe.storageErr, probe.mapAsGameOk ? "ok" : "FAILED",
-              probe.mapRepairedOk ? "ok" : "FAILED", probe.mapErr)
+        for (int t = 0; t < kProbeTargetCount; ++t) {
+            LOG_I("Persistent map probe [%s]: storage=%s(0x%x) E2=%s(0x%x) C2=%s(0x%x) W=%s(0x%x)",
+                  kProbeTargetNames[t], probe.storageOk[t] ? "ok" : "FAILED", probe.storageErr[t],
+                  probe.mapOk[t][0] ? "ok" : "FAILED", probe.mapErr[t][0], probe.mapOk[t][1] ? "ok" : "FAILED",
+                  probe.mapErr[t][1], probe.mapOk[t][2] ? "ok" : "FAILED", probe.mapErr[t][2])
+        }
 
-        if (probe.mapAsGameOk || probe.mapRepairedOk) {
-            if (!probe.mapAsGameOk && probe.mapRepairedOk) {
+        if (probe.WorksOnGameTarget()) {
+            if (!probe.mapOk[1][0] && probe.mapOk[1][1]) {
                 LOG_I("Persistent mapping needs UNSYNCHRONIZED stripped; buffer.cpp already does this")
             }
             AppendExtension("GL_ARB_buffer_storage");
         } else {
-            LOG_W_FORCE("Persistent mapping is unusable here (storage %s, both map attempts failed, glError=0x%x); "
+            LOG_W_FORCE("Persistent mapping is unusable on GL_UNIFORM_BUFFER (storage %s, E2 and C2 both failed); "
                         "withholding GL_ARB_buffer_storage so the game allocates mutable buffers",
-                        probe.storageOk ? "ok" : "FAILED", probe.mapErr)
+                        probe.storageOk[1] ? "ok" : "FAILED")
         }
     }
 

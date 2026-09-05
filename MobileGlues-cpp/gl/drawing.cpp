@@ -97,41 +97,49 @@ static inline __attribute__((always_inline)) void readbackAtomicCounters() {
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawArrays(mode, first, count);
 }
 
 extern "C" GLAPI GLAPIENTRY void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawElements(mode, count, type, indices);
 }
 
 extern "C" GLAPI GLAPIENTRY void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawArraysInstanced(mode, first, count, instancecount);
 }
 
 extern "C" GLAPI GLAPIENTRY void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount) {
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawElementsInstanced(mode, count, type, indices, instancecount);
 }
 
 extern "C" GLAPI GLAPIENTRY void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices) {
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawRangeElements(mode, start, end, count, type, indices);
 }
 
 extern "C" GLAPI GLAPIENTRY void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const void *indices, GLint basevertex) {
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
 }
 
 extern "C" GLAPI GLAPIENTRY void glDrawArraysIndirect(GLenum mode, const void *indirect) {
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawArraysIndirect(mode, indirect);
 }
 
 extern "C" GLAPI GLAPIENTRY void glDrawElementsIndirect(GLenum mode, GLenum type, const void *indirect) {
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawElementsIndirect(mode, type, indirect);
 }
