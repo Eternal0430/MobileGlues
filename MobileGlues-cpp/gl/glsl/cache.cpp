@@ -17,10 +17,9 @@ using namespace std;
 // Persist the cache to disk after this many new entries, so compiled
 // shaders survive process termination. On Android the process is typically
 // killed with SIGKILL, which never runs static destructors — so the
-// destructor-based save() in ~Cache() is unreliable. Each saveLocked()
+// destructor-based save() in ~Cache() is unreliable. A background thread
 // rewrites the whole file, so the threshold balances I/O cost against the
 // risk of losing entries that were added but not yet persisted.
-static constexpr size_t SAVE_THRESHOLD = 8;
 
 // Fast non-cryptographic hash (FNV-1a 64-bit) for cache keys.
 // Stored in the first 8 bytes of the 32-byte array; remaining bytes are zero.
@@ -79,9 +78,11 @@ Cache::Cache() {
 Cache::~Cache() {
     // Persist any remaining dirty entries at graceful process exit. On
     // Android this rarely runs (processes are killed with SIGKILL, which
-    // does not invoke static destructors), so the periodic saves performed
-    // by putByHash() during runtime are the primary persistence mechanism.
-    if (dirty) save();
+    // does not invoke static destructors), so the background thread started
+    // by putByHash() is the primary persistence mechanism — it saves once
+    // compilation goes quiet, rather than on a fixed entry count.
+    stop_save_thread.store(true, std::memory_order_release);
+    save();
 }
 
 const char* Cache::get(const char* glsl, int* return_code) {
@@ -127,16 +128,138 @@ void Cache::putByHash(const std::array<uint8_t, 32>& hash, const char* essl, int
 
     maintainCacheSize();
     dirty = true;
-    ++pendingWrites;
 
-    // Periodically persist the cache to disk so compiled shaders survive
-    // process termination (e.g. SIGKILL on Android, where ~Cache() never
-    // runs). Writing on every put would be too expensive — the entire
-    // cache is rewritten each time — so writes are batched. saveLocked()
-    // reuses the lock already held here (save() would deadlock).
-    if (pendingWrites >= SAVE_THRESHOLD) {
-        saveLocked();
+    // Record when the last entry arrived, then let the background thread
+    // decide when to write.
+    //
+    // This used to call saveLocked() every SAVE_THRESHOLD (8) new entries.
+    // That was quadratic: saveLocked() rewrites the ENTIRE cache file, so
+    // saving after every 8 new entries during a run that compiles N shaders
+    // writes roughly N²/16 entries' worth of data in total. With a cache
+    // budget of 710 MB (the configured maxGlslCacheSize) and a cold start
+    // compiling a few thousand shaders, that is multiple gigabytes written
+    // to flash — synchronously, while HOLDING cacheMutex, so every other
+    // compiling thread blocks behind it.
+    //
+    // The measured symptom matched exactly: hundreds of thousands of GL
+    // calls at a few thousand per second for many minutes, with
+    // eglSwapBuffers never once called, because the render thread sits in
+    // join() waiting for the compile executor to finish.
+    //
+    // Deferring to a quiet moment means a cold start writes the cache once,
+    // after compilation finishes, instead of hundreds of times during it.
+    last_put_time.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                        std::memory_order_release);
+    MaybeStartSaveThread();
+}
+
+void Cache::MaybeStartSaveThread() {
+    if (stop_save_thread.load(std::memory_order_acquire)) return;
+    if (save_thread_started.exchange(true, std::memory_order_acq_rel)) return;
+    std::thread(&Cache::SaveThreadLoop, this).detach();
+}
+
+void Cache::SaveThreadLoop() {
+    // Save once compilation has gone quiet for kIdleBeforeSave, rather than
+    // while it is still streaming. A cold start compiles thousands of
+    // shaders back to back; writing the file after each batch would be
+    // wasted work, since the next batch would immediately invalidate it.
+    constexpr auto kIdleBeforeSave = std::chrono::seconds(3);
+    constexpr auto kPollInterval = std::chrono::seconds(2);
+    // Upper bound on how long new entries may sit unsaved. A compile storm
+    // that never goes quiet (a very long first run) would otherwise lose
+    // everything if the process is killed, since nothing would ever be
+    // written until it ended.
+    constexpr auto kMaxSaveInterval = std::chrono::seconds(60);
+
+    auto last_save = std::chrono::steady_clock::now();
+
+    while (!stop_save_thread.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(kPollInterval);
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto last = std::chrono::steady_clock::time_point(
+            std::chrono::steady_clock::duration(last_put_time.load(std::memory_order_acquire)));
+        if (last.time_since_epoch().count() == 0) continue;
+
+        const bool quiet = (now - last) >= kIdleBeforeSave;
+        const bool overdue = (now - last_save) >= kMaxSaveInterval;
+        if (!quiet && !overdue) continue;
+
+        bool was_dirty = false;
+        {
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            was_dirty = dirty;
+        }
+        if (was_dirty) FlushToDisk();
+        last_save = std::chrono::steady_clock::now();
     }
+
+    // Final flush on the way out.
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        if (dirty) FlushToDisk();
+    }
+}
+
+void Cache::FlushToDisk() {
+    // Copy under the lock, write after releasing it.
+    std::vector<CacheEntry> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        snapshot = SnapshotLocked();
+    }
+    if (snapshot.empty()) return;
+
+    WriteSnapshot(snapshot);
+
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    dirty = false;
+}
+
+void Cache::WriteSnapshot(const std::vector<CacheEntry>& snapshot) {
+    if (global_settings.max_glsl_cache_size <= 0) return;
+
+    // Write to a temporary file first, then atomically rename it over the
+    // real cache file, so a process killed mid-write cannot leave a
+    // truncated cache behind.
+    const std::string tmpPath = std::string(glsl_cache_file_path) + ".write_tmp";
+    ofstream file(tmpPath, ios::binary | ios::trunc);
+    if (!file) return;
+
+    const size_t count = snapshot.size();
+    file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+
+    for (const auto& entry : snapshot) {
+        file.write(reinterpret_cast<const char*>(entry.sha256.data()), (long)entry.sha256.size());
+        file.write(reinterpret_cast<const char*>(&entry.return_code), sizeof(entry.return_code));
+        const size_t esslSize = entry.size;
+        file.write(reinterpret_cast<const char*>(&esslSize), sizeof(esslSize));
+        file.write(entry.essl.data(), (long)esslSize);
+    }
+
+    file.flush();
+    file.close();
+
+    if (!file) {
+        LOG_E("Failed to write shader cache temp file: %s", tmpPath.c_str())
+        return;
+    }
+
+    if (rename(tmpPath.c_str(), glsl_cache_file_path) != 0) {
+        LOG_E("Failed to atomically rename shader cache file: %s -> %s",
+              tmpPath.c_str(), glsl_cache_file_path)
+        return;
+    }
+
+    LOG_V("Wrote shader cache: %zu entries", snapshot.size());
+}
+
+std::vector<Cache::CacheEntry> Cache::SnapshotLocked() const {
+    std::vector<CacheEntry> snapshot;
+    snapshot.reserve(cacheList.size());
+    for (const auto& entry : cacheList) snapshot.push_back(entry);
+    return snapshot;
 }
 
 void Cache::maintainCacheSize() {
@@ -192,53 +315,9 @@ bool Cache::load() {
     }
 }
 
-void Cache::saveLocked() {
-    // Assumes cacheMutex is held by the caller.
-    if (global_settings.max_glsl_cache_size <= 0) return;
-
-    // Write to a temporary file first, then atomically rename it over the
-    // real cache file. This guarantees glsl_cache.tmp is never left in a
-    // partially-written (corrupt) state if the process is killed mid-write
-    // (e.g. SIGKILL on Android). A corrupt file would cause load() to
-    // discard the entire cache on the next launch, defeating the purpose.
-    string tmpPath = string(glsl_cache_file_path) + ".write_tmp";
-    ofstream file(tmpPath, ios::binary | ios::trunc);
-    if (!file) return;
-
-    size_t count = cacheList.size();
-    file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-
-    for (const auto& entry : cacheList) {
-        file.write(reinterpret_cast<const char*>(entry.sha256.data()), (long)entry.sha256.size());
-        file.write(reinterpret_cast<const char*>(&entry.return_code), sizeof(entry.return_code));
-        size_t esslSize = entry.size;
-        file.write(reinterpret_cast<const char*>(&esslSize), sizeof(esslSize));
-        file.write(entry.essl.data(), (long)esslSize);
-    }
-
-    file.flush();
-    file.close();
-
-    // Only swap in the new file if the write completed successfully;
-    // otherwise keep the existing cache file intact.
-    if (!file) {
-        LOG_E("Failed to write shader cache temp file: %s", tmpPath.c_str())
-        return;
-    }
-
-    if (rename(tmpPath.c_str(), glsl_cache_file_path) != 0) {
-        LOG_E("Failed to atomically rename shader cache file: %s -> %s",
-              tmpPath.c_str(), glsl_cache_file_path)
-        return;
-    }
-
-    dirty = false;
-    pendingWrites = 0;
-}
 
 void Cache::save() {
-    std::lock_guard<std::mutex> lock(cacheMutex);
-    saveLocked();
+    FlushToDisk();
 }
 
 Cache& Cache::get_instance() {
