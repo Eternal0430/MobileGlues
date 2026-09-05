@@ -265,20 +265,48 @@ bool CreateThreadContext(EGLDisplay dpy, EGLContext share, EGLSurface surf) {
     return false;
 }
 
-// One binding attempt, reported either way.
+// One binding attempt, judged by what actually took effect.
 //
-// Every previous design failed with no record of why. The application's context
-// is refused for reasons that differ per device and per thread, and guessing
-// cost five iterations; printing the EGL error turns the next run into an
-// answer instead of another hypothesis.
+// The return value of eglMakeCurrent is not trustworthy on this device. It was
+// measured returning EGL_FALSE while eglGetError() reported 0x3000, which is
+// EGL_SUCCESS — "failed, and nothing went wrong". A real log line:
+//
+//     app context + recorded window surface: FAILED (0x3000)
+//     app context surfaceless: bound
+//
+// Taking that at face value is what kept the picture frozen: the ladder treated
+// the first step as a failure, fell through, and bound the same context again
+// with NO SURFACE. That second call succeeded and wiped out the binding that had
+// a surface. Everything afterwards was drawn into nothing while eglSwapBuffers
+// kept presenting the frame that never changed.
+//
+// So the result is decided by observed state — eglGetCurrentContext() and
+// eglGetCurrentSurface() — not by the return value. Both are still logged,
+// because the disagreement between them is itself worth seeing.
 bool TryBind(EGLDisplay dpy, EGLContext ctx, EGLSurface surf, const char* what) {
     LOAD_EGL(eglMakeCurrent);
+    LOAD_EGL(eglGetCurrentContext);
+    LOAD_EGL(eglGetCurrentSurface);
     LOAD_EGL(eglGetError);
-    if (egl_eglMakeCurrent(dpy, surf, surf, ctx) == EGL_TRUE) {
-        LOG_W_FORCE("BindFallbackEGLContext: [%s] %s: bound", CurrentThreadLabel(), what);
+
+    const EGLBoolean ret = egl_eglMakeCurrent(dpy, surf, surf, ctx);
+    const EGLint err = egl_eglGetError();
+    const EGLContext now_ctx = egl_eglGetCurrentContext();
+    const EGLSurface now_surf = egl_eglGetCurrentSurface(EGL_DRAW);
+
+    // A surfaceless bind is satisfied by the context alone. A bind that asked
+    // for a surface must actually be on that surface — landing on EGL_NO_SURFACE
+    // instead means the surface was refused and drawing will be discarded.
+    const bool took_effect = (now_ctx == ctx) && (surf == kNoSurface || now_surf == surf);
+
+    if (took_effect) {
+        LOG_W_FORCE("BindFallbackEGLContext: [%s] %s: bound (ret=%d err=0x%x surf=%p)", CurrentThreadLabel(), what,
+                    (int)ret, err, now_surf);
         return true;
     }
-    LOG_W_FORCE("BindFallbackEGLContext: [%s] %s: FAILED (0x%x)", CurrentThreadLabel(), what, egl_eglGetError());
+    LOG_W_FORCE("BindFallbackEGLContext: [%s] %s: NOT BOUND (ret=%d err=0x%x) — wanted ctx=%p surf=%p, got ctx=%p "
+                "surf=%p",
+                CurrentThreadLabel(), what, (int)ret, err, ctx, surf, now_ctx, now_surf);
     return false;
 }
 
@@ -375,9 +403,15 @@ bool BindFallbackEGLContextIfNeeded() {
     // Everything needed to explain a refusal, in one line. Five designs were
     // built on guesses about these values; this prints them.
     LOG_W_FORCE("BindFallbackEGLContext: [%s] no current context. this thread: ctx=%p draw=%p dpy=%p | recorded "
-                "app: dpy=%p ctx=%p draw=%p presenting=%p",
+                "app: dpy=%p ctx=%p draw=%p presenting=%p | own dpy=%p",
                 CurrentThreadLabel(), egl_eglGetCurrentContext(), egl_eglGetCurrentSurface(EGL_DRAW),
-                egl_eglGetCurrentDisplay(), t.display, t.context, t.draw_surface, t.presenting_surface);
+                egl_eglGetCurrentDisplay(), t.display, t.context, t.draw_surface, t.presenting_surface, eglDisplay);
+    if (have_app && t.display != eglDisplay) {
+        LOG_W_FORCE("BindFallbackEGLContext: [%s] the application is on a DIFFERENT EGLDisplay (%p) than the one "
+                    "MobileGLES initialized (%p). A context may only be bound on the display it was created for, "
+                    "so bindings here are likely to be refused",
+                    CurrentThreadLabel(), t.display, eglDisplay);
+    }
 
     const bool can_use_presenting =
         have_presenting && t.presenting_thread != 0 && pthread_equal(t.presenting_thread, pthread_self()) != 0;
