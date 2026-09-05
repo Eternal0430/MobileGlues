@@ -12,6 +12,7 @@
 #include "../gles/loader.h"
 #include "../includes.h"
 #include <EGL/egl.h>
+#include <mutex>
 #include <string.h>
 
 #define DEBUG 0
@@ -140,6 +141,23 @@ void destroy_temp_egl_ctx() {
     egl_eglMakeCurrent(eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 }
 
+// Serialises use of the single fallback context.
+//
+// An EGLContext may be current on one thread at a time. The fallback context is
+// a single shared object, so two context-less threads must not hold it at once.
+// Minecraft is multithreaded here in a way that makes this reachable in
+// practice: PipelineCache.get() compiles shaders on Util.backgroundExecutor()
+// and the render thread blocks in CompletableFuture.join() waiting for it. The
+// compile calls glCreateShader / glCompileShader, so both threads want the
+// fallback context — and if the render thread holds it across join(), the
+// worker can never acquire it. That is a deadlock, not a slow path.
+//
+// The lock is only taken by threads that are actually about to borrow the
+// fallback context. A thread that already has its own context takes neither the
+// lock nor the context, so a correctly configured launcher pays nothing.
+static std::mutex g_fallback_context_mutex;
+static thread_local bool t_warned_about_missing_context = false;
+
 bool BindFallbackEGLContextIfNeeded() {
     if (!g_fallback_context_ready) return false;
 
@@ -149,75 +167,53 @@ bool BindFallbackEGLContextIfNeeded() {
 
     if (egl_eglGetCurrentContext() != EGL_NO_CONTEXT) return false;
 
-    if (egl_eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext) != EGL_TRUE) {
-        LOG_W_FORCE("BindFallbackEGLContext: eglMakeCurrent failed (0x%x)", egl_eglGetError());
+    // Serialise before binding: if another thread is holding the fallback
+    // context, wait for it to hand the context back rather than racing it.
+    g_fallback_context_mutex.lock();
+
+    // Re-check under the lock. A concurrent eglMakeCurrent from the application
+    // may have given this thread a context while we waited.
+    if (egl_eglGetCurrentContext() != EGL_NO_CONTEXT) {
+        g_fallback_context_mutex.unlock();
         return false;
     }
 
-    LOG_W_FORCE("BindFallbackEGLContext: thread had no current EGL context, "
-                "bound MobileGLES fallback pbuffer context for a host query");
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// EnsureHostContext — bind once, then leave it bound
-//
-// A host GLES driver discards every call made from a thread with no current
-// EGL context: no object is created, no error is raised, queries simply return
-// 0 or NULL. That is not a theoretical concern here — it is what produced the
-// NULL glGetString, the zeroed glGetIntegerv, the NULL glMapBufferRange and
-// the zero maxAnisotropy earlier in this session, all on the same render
-// thread. Each of those stopped reproducing once the call was wrapped in a
-// scoped fallback binding.
-//
-// The earlier scoped variant bound and immediately unbound, which is correct
-// but costs two eglMakeCurrent calls per GL entry point. On a thread that has
-// no context of its own that would apply to every draw and every texture
-// upload, which is far too slow. So bind once and keep it: after the first
-// call the thread has a current context, every later guard is a single TLS
-// read, and the overhead disappears.
-//
-// Returns true only when this call is the one that bound the context, so
-// callers can tell "the previous result was suspect, re-read it" from
-// "a context was already there".
-// ---------------------------------------------------------------------------
-static thread_local bool t_warned_about_missing_context = false;
-
-bool EnsureHostContext() {
-    if (!g_fallback_context_ready) return false;
-
-    LOAD_EGL(eglGetCurrentContext);
-    if (egl_eglGetCurrentContext() != EGL_NO_CONTEXT) return false;
-
-    LOAD_EGL(eglMakeCurrent);
-    LOAD_EGL(eglGetError);
-
     if (egl_eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext) != EGL_TRUE) {
-        LOG_W_FORCE("EnsureHostContext: eglMakeCurrent failed (0x%x) — host GL calls from this thread will be "
+        LOG_W_FORCE("BindFallbackEGLContext: eglMakeCurrent failed (0x%x) — host GL calls from this thread will be "
                     "silently discarded",
                     egl_eglGetError());
+        g_fallback_context_mutex.unlock();
         return false;
     }
 
     if (!t_warned_about_missing_context) {
         t_warned_about_missing_context = true;
-        LOG_W_FORCE("EnsureHostContext: this thread had no current EGL context, so MobileGLES bound its fallback "
-                    "pbuffer context and left it bound. Every host GL call made from a context-less thread is "
-                    "discarded without error, which is how a shader compile or a buffer map fails with no "
-                    "explanation. This indicates the launcher never called eglMakeCurrent on the render thread.");
+        LOG_W_FORCE("BindFallbackEGLContext: this thread had no current EGL context, so MobileGLES borrowed its "
+                    "fallback pbuffer context for the duration of one host GL call. Every host GL call made from "
+                    "a context-less thread is discarded without error, which is how a shader compile or a buffer "
+                    "map fails with no explanation. This indicates the launcher never called eglMakeCurrent on "
+                    "this thread. The context is released immediately afterwards so that other threads — notably "
+                    "the background executor that compiles shaders while the render thread waits in join() — "
+                    "can acquire it.");
     }
     return true;
 }
 
+// Pairs a successful BindFallbackEGLContextIfNeeded(). Callers must invoke it
+// exactly once for every call that returned true.
 void UnbindFallbackEGLContext() {
-    if (!g_fallback_context_ready) return;
-
     LOAD_EGL(eglGetCurrentContext);
     LOAD_EGL(eglMakeCurrent);
 
     // Only release it if it is still the one we bound — never yank a context
     // that the caller has since replaced with its own.
-    if (egl_eglGetCurrentContext() != eglContext) return;
+    if (egl_eglGetCurrentContext() == eglContext) {
+        egl_eglMakeCurrent(eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
 
-    egl_eglMakeCurrent(eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    // Unconditional, and paired with the lock taken on the successful bind.
+    // Early-returning above without unlocking would strand the mutex and hang
+    // every other context-less thread — including the shader-compiling worker
+    // the render thread is waiting on.
+    g_fallback_context_mutex.unlock();
 }

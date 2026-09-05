@@ -182,22 +182,6 @@ extern "C"
     bool BindFallbackEGLContextIfNeeded();
     void UnbindFallbackEGLContext();
 
-    // -------------------------------------------------------------------------
-    // EnsureHostContext — the variant every host GL entry point should use.
-    //
-    // Binds the fallback context when the calling thread has none, and then
-    // LEAVES IT BOUND. Unbinding after each call would mean two eglMakeCurrent
-    // round-trips per GL entry point, which on a context-less thread applies to
-    // every draw call and every texture upload — far too slow. Leaving it bound
-    // makes every subsequent guard a single eglGetCurrentContext TLS read.
-    //
-    // When the thread already has a context (the normal case) this does
-    // nothing at all, so it cannot disturb a working setup.
-    //
-    // Returns true only if this call is the one that bound the context.
-    // -------------------------------------------------------------------------
-    bool EnsureHostContext();
-
 #ifdef __cplusplus
 }
 #endif
@@ -219,15 +203,23 @@ extern "C"
 //   Nesting is safe — an inner instance sees a current context and does
 //   nothing.
 //
-//   The context is deliberately left bound on exit: see EnsureHostContext.
-//   The destructor is kept so that the type stays an RAII scope marker and so
-//   that existing call sites need no changes.
+//   The context is released on exit, and must be. Minecraft compiles shaders
+//   on Util.backgroundExecutor() while the render thread blocks in
+//   CompletableFuture.join(); that worker calls glCreateShader /
+//   glCompileShader, so both threads need the fallback context. Holding it
+//   across the join would deadlock — the worker waiting for a context the
+//   render thread will not give up until the worker finishes. Borrowing it for
+//   the duration of one call is what makes that arrangement work. Access is
+//   serialised by a mutex so two context-less threads never hold it at once.
 // ==========================================================================
 #ifdef __cplusplus
 
 class ScopedHostContext {
 public:
-    ScopedHostContext() : bound_(EnsureHostContext()) {}
+    ScopedHostContext() : bound_(BindFallbackEGLContextIfNeeded()) {}
+    ~ScopedHostContext() {
+        if (bound_) UnbindFallbackEGLContext();
+    }
     ScopedHostContext(const ScopedHostContext&) = delete;
     ScopedHostContext& operator=(const ScopedHostContext&) = delete;
     // True when this instance is the one that bound the context, i.e. the
