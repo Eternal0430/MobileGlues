@@ -13,6 +13,7 @@
 #include "../gles/loader.h"
 #include "../glx/lookup.h"
 #include "loader.h"
+#include <vector>
 
 #include <atomic>
 #include <mutex>
@@ -96,6 +97,7 @@ void mg_egl_note_make_current(EGLDisplay dpy, EGLSurface draw, EGLSurface read, 
     g_target.display = dpy;
     g_target.context = ctx;
     g_target.have_binding = true;
+    g_target.binding_thread = pthread_self();
     if (draw != EGL_NO_SURFACE) {
         g_target.draw_surface = draw;
         g_target.read_surface = read;
@@ -199,41 +201,70 @@ void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok) {
     }
 }
 
+
+namespace {
+
+// EGL 1.5 entry points take EGLAttrib (pointer-sized, 64-bit on arm64); the
+// EGL_EXT_platform_base ones this library actually loads take EGLint (32-bit).
+// Casting the pointer would make the host read two 32-bit halves of each
+// 64-bit value, so the values are copied one by one instead.
+std::vector<EGLint> NarrowAttribs(const EGLAttrib* attribs) {
+    std::vector<EGLint> out;
+    if (!attribs) return out;
+    for (size_t i = 0; attribs[i] != EGL_NONE; i += 2) {
+        out.push_back(static_cast<EGLint>(attribs[i]));
+        out.push_back(static_cast<EGLint>(attribs[i + 1]));
+    }
+    out.push_back(EGL_NONE);
+    return out;
+}
+
+}  // namespace
+
 extern "C"
 {
 #define EGL_API __attribute__((visibility("default")))
     EGL_API EGLint eglGetError(void) {
+        mg_egl_note_call(__func__);
         LOG_D("eglGetError");
         LOAD_EGL(eglGetError)
 
         return egl_eglGetError();
     }
-
     EGL_API EGLDisplay eglGetDisplay(EGLNativeDisplayType display_id) {
+        mg_egl_note_call(__func__);
         LOG_D("eglGetDisplay, display_id: %p", display_id);
         LOAD_EGL(eglGetDisplay)
         return egl_eglGetDisplay(display_id);
     }
 
     EGL_API EGLBoolean eglInitialize(EGLDisplay dpy, EGLint* major, EGLint* minor) {
+        mg_egl_note_call(__func__);
         LOG_D("eglInitialize, dpy: %p, major: %p, minor: %p", dpy, major, minor);
         LOAD_EGL(eglInitialize)
         return egl_eglInitialize(dpy, major, minor);
     }
 
     EGL_API EGLBoolean eglTerminate(EGLDisplay dpy) {
+        mg_egl_note_call(__func__);
         LOG_D("eglTerminate, dpy: %p", dpy);
         LOAD_EGL(eglTerminate)
         return egl_eglTerminate(dpy);
     }
 
     EGL_API const char* eglQueryString(EGLDisplay dpy, EGLint name) {
-        LOG_D("eglQueryString, dpy: %p, name: %d", dpy, name);
+        mg_egl_note_call(__func__);
         LOAD_EGL(eglQueryString)
-        return egl_eglQueryString(dpy, name);
+        const char* result = egl_eglQueryString ? egl_eglQueryString(dpy, name) : nullptr;
+        // What the application learns here decides which surface creation path
+        // it takes: an EGL 1.5 version string is what makes it call
+        // eglCreatePlatformWindowSurface instead of eglCreateWindowSurface.
+        LOG_W_FORCE("eglQueryString(dpy=%p, name=%d) -> %s", dpy, name, result ? result : "(null)");
+        return result;
     }
 
     EGL_API EGLBoolean eglGetConfigs(EGLDisplay dpy, EGLConfig* configs, EGLint config_size, EGLint* num_config) {
+        mg_egl_note_call(__func__);
         LOG_D("eglGetConfigs, dpy: %p, configs: %p, config_size: %d, num_config: %p", dpy, configs, config_size,
               num_config);
         LOAD_EGL(eglGetConfigs)
@@ -242,6 +273,7 @@ extern "C"
 
     EGL_API EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint* attrib_list, EGLConfig* configs,
                                        EGLint config_size, EGLint* num_config) {
+        mg_egl_note_call(__func__);
         LOG_D("eglChooseConfig, dpy: %p, attrib_list: %p, configs: %p, config_size: "
               "%d, num_config: %p",
               dpy, attrib_list, configs, config_size, num_config);
@@ -250,6 +282,7 @@ extern "C"
     }
 
     EGL_API EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute, EGLint* value) {
+        mg_egl_note_call(__func__);
         LOG_D("eglGetConfigAttrib, dpy: %p, config: %p, attribute: %d, value: %p", dpy, config, attribute, value);
         LOAD_EGL(eglGetConfigAttrib)
         return egl_eglGetConfigAttrib(dpy, config, attribute, value);
@@ -257,6 +290,7 @@ extern "C"
 
     EGL_API EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config, EGLNativeWindowType win,
                                               const EGLint* attrib_list) {
+        mg_egl_note_call(__func__);
         LOG_D("eglCreateWindowSurface, dpy: %p, config: %p, win: %p, attrib_list: %p", dpy, config, win, attrib_list);
         LOAD_EGL(eglCreateWindowSurface)
         EGLSurface surf = egl_eglCreateWindowSurface(dpy, config, win, attrib_list);
@@ -264,7 +298,41 @@ extern "C"
         return surf;
     }
 
+    // EGL 1.5 platform surface creation.
+    //
+    // This was declared in loader.h but never exported, and that gap is the
+    // most likely reason the picture never appears. It was measured once, in a
+    // session that logged a recorded window surface of 0x77c45f3d80 and then
+    // 1251 swaps against 0x7806563d80 — two different surfaces. The second one
+    // could not be seen from anywhere in this library, because the only call
+    // that could have created it is this one, and it was not exported.
+    //
+    // The consequence is not a failure but a silent mismatch: the fallback
+    // binds the render thread to the one surface it can see, the application
+    // presents the other, and every frame is drawn to a surface that is never
+    // shown. No error is raised at any point.
+    EGL_API EGLSurface eglCreatePlatformWindowSurface(EGLDisplay dpy, EGLConfig config, void* native_window,
+                                                      const EGLAttrib* attrib_list) {
+        mg_egl_note_call(__func__);
+        LOG_D("eglCreatePlatformWindowSurface, dpy: %p, config: %p, native_window: %p", dpy, config, native_window);
+        LOAD_EGL(eglCreatePlatformWindowSurface)
+        if (!egl_eglCreatePlatformWindowSurface) {
+            // EGL 1.4 host: fall back to the classic entry point rather than
+            // returning EGL_NO_SURFACE, which the application would read as a
+            // hard failure.
+            LOG_W_FORCE("eglCreatePlatformWindowSurface: unavailable, using eglCreateWindowSurface");
+            return eglCreateWindowSurface(dpy, config,
+                                          reinterpret_cast<EGLNativeWindowType>(native_window), nullptr);
+        }
+        const std::vector<EGLint> narrow = NarrowAttribs(attrib_list);
+        EGLSurface surf =
+            egl_eglCreatePlatformWindowSurface(dpy, config, native_window, narrow.empty() ? nullptr : narrow.data());
+        mg_egl_note_window_surface(dpy, config, surf);
+        return surf;
+    }
+
     EGL_API EGLSurface eglCreatePbufferSurface(EGLDisplay dpy, EGLConfig config, const EGLint* attrib_list) {
+        mg_egl_note_call(__func__);
         LOG_D("eglCreatePbufferSurface, dpy: %p, config: %p, attrib_list: %p", dpy, config, attrib_list);
         LOAD_EGL(eglCreatePbufferSurface)
         return egl_eglCreatePbufferSurface(dpy, config, attrib_list);
@@ -272,6 +340,7 @@ extern "C"
 
     EGL_API EGLSurface eglCreatePixmapSurface(EGLDisplay dpy, EGLConfig config, EGLNativePixmapType pixmap,
                                               const EGLint* attrib_list) {
+        mg_egl_note_call(__func__);
         LOG_D("eglCreatePixmapSurface, dpy: %p, config: %p, pixmap: %p, attrib_list: "
               "%p",
               dpy, config, pixmap, attrib_list);
@@ -280,6 +349,7 @@ extern "C"
     }
 
     EGL_API EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface surface) {
+        mg_egl_note_call(__func__);
         LOG_D("eglDestroySurface, dpy: %p, surface: %p", dpy, surface);
         LOAD_EGL(eglDestroySurface)
         EGLBoolean ok = egl_eglDestroySurface(dpy, surface);
@@ -288,30 +358,35 @@ extern "C"
     }
 
     EGL_API EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface surface, EGLint attribute, EGLint* value) {
+        mg_egl_note_call(__func__);
         LOG_D("eglQuerySurface, dpy: %p, surface: %p, attribute: %d, value: %p", dpy, surface, attribute, value);
         LOAD_EGL(eglQuerySurface)
         return egl_eglQuerySurface(dpy, surface, attribute, value);
     }
 
     EGL_API EGLBoolean eglBindAPI(EGLenum api) {
+        mg_egl_note_call(__func__);
         LOG_D("eglBindAPI, api: %d", api);
         LOAD_EGL(eglBindAPI)
         return egl_eglBindAPI(api);
     }
 
     EGL_API EGLenum eglQueryAPI(void) {
+        mg_egl_note_call(__func__);
         LOG_D("eglQueryAPI");
         LOAD_EGL(eglQueryAPI)
         return egl_eglQueryAPI();
     }
 
     EGL_API EGLBoolean eglWaitClient(void) {
+        mg_egl_note_call(__func__);
         LOG_D("eglWaitClient");
         LOAD_EGL(eglWaitClient)
         return egl_eglWaitClient();
     }
 
     EGL_API EGLBoolean eglReleaseThread(void) {
+        mg_egl_note_call(__func__);
         LOG_D("eglReleaseThread");
         LOAD_EGL(eglReleaseThread)
         return egl_eglReleaseThread();
@@ -319,6 +394,7 @@ extern "C"
 
     EGL_API EGLSurface eglCreatePbufferFromClientBuffer(EGLDisplay dpy, EGLenum buftype, EGLClientBuffer buffer,
                                                         EGLConfig config, const EGLint* attrib_list) {
+        mg_egl_note_call(__func__);
         LOG_D("eglCreatePbufferFromClientBuffer, dpy: %p, buftype: %d, buffer: %p, "
               "config: %p, attrib_list: %p",
               dpy, buftype, buffer, config, attrib_list);
@@ -327,24 +403,28 @@ extern "C"
     }
 
     EGL_API EGLBoolean eglSurfaceAttrib(EGLDisplay dpy, EGLSurface surface, EGLint attribute, EGLint value) {
+        mg_egl_note_call(__func__);
         LOG_D("eglSurfaceAttrib, dpy: %p, surface: %p, attribute: %d, value: %d", dpy, surface, attribute, value);
         LOAD_EGL(eglSurfaceAttrib)
         return egl_eglSurfaceAttrib(dpy, surface, attribute, value);
     }
 
     EGL_API EGLBoolean eglBindTexImage(EGLDisplay dpy, EGLSurface surface, EGLint buffer) {
+        mg_egl_note_call(__func__);
         LOG_D("eglBindTexImage, dpy: %p, surface: %p, buffer: %d", dpy, surface, buffer);
         LOAD_EGL(eglBindTexImage)
         return egl_eglBindTexImage(dpy, surface, buffer);
     }
 
     EGL_API EGLBoolean eglReleaseTexImage(EGLDisplay dpy, EGLSurface surface, EGLint buffer) {
+        mg_egl_note_call(__func__);
         LOG_D("eglReleaseTexImage, dpy: %p, surface: %p, buffer: %d", dpy, surface, buffer);
         LOAD_EGL(eglReleaseTexImage)
         return egl_eglReleaseTexImage(dpy, surface, buffer);
     }
 
     EGL_API EGLBoolean eglSwapInterval(EGLDisplay dpy, EGLint interval) {
+        mg_egl_note_call(__func__);
         LOG_D("eglSwapInterval, dpy: %p, interval: %d", dpy, interval);
         LOAD_EGL(eglSwapInterval)
         return egl_eglSwapInterval(dpy, interval);
@@ -352,6 +432,7 @@ extern "C"
 
     EGL_API EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_context,
                                         const EGLint* attrib_list) {
+        mg_egl_note_call(__func__);
         LOG_D("eglCreateContext, dpy: %p, config: %p, share_context: %p, "
               "attrib_list: %p",
               dpy, config, share_context, attrib_list);
@@ -360,12 +441,14 @@ extern "C"
     }
 
     EGL_API EGLBoolean eglDestroyContext(EGLDisplay dpy, EGLContext ctx) {
+        mg_egl_note_call(__func__);
         LOG_D("eglDestroyContext, dpy: %p, ctx: %p", dpy, ctx);
         LOAD_EGL(eglDestroyContext)
         return egl_eglDestroyContext(dpy, ctx);
     }
 
     EGL_API EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
+        mg_egl_note_call(__func__);
         LOG_D("eglMakeCurrent, dpy: %p, draw: %p, read: %p, ctx: %p", dpy, draw, read, ctx);
         LOAD_EGL(eglMakeCurrent)
         EGLBoolean ok = egl_eglMakeCurrent(dpy, draw, read, ctx);
@@ -382,42 +465,49 @@ extern "C"
     }
 
     EGL_API EGLContext eglGetCurrentContext(void) {
+        mg_egl_note_call(__func__);
         LOG_D("eglGetCurrentContext");
         LOAD_EGL(eglGetCurrentContext)
         return egl_eglGetCurrentContext();
     }
 
     EGL_API EGLSurface eglGetCurrentSurface(EGLint readdraw) {
+        mg_egl_note_call(__func__);
         LOG_D("eglGetCurrentSurface, readdraw: %d", readdraw);
         LOAD_EGL(eglGetCurrentSurface)
         return egl_eglGetCurrentSurface(readdraw);
     }
 
     EGL_API EGLDisplay eglGetCurrentDisplay(void) {
+        mg_egl_note_call(__func__);
         LOG_D("eglGetCurrentDisplay");
         LOAD_EGL(eglGetCurrentDisplay)
         return egl_eglGetCurrentDisplay();
     }
 
     EGL_API EGLBoolean eglQueryContext(EGLDisplay dpy, EGLContext ctx, EGLint attribute, EGLint* value) {
+        mg_egl_note_call(__func__);
         LOG_D("eglQueryContext, dpy: %p, ctx: %p, attribute: %d, value: %p", dpy, ctx, attribute, value);
         LOAD_EGL(eglQueryContext)
         return egl_eglQueryContext(dpy, ctx, attribute, value);
     }
 
     EGL_API EGLBoolean eglWaitGL(void) {
+        mg_egl_note_call(__func__);
         LOG_D("eglWaitGL");
         LOAD_EGL(eglWaitGL)
         return egl_eglWaitGL();
     }
 
     EGL_API EGLBoolean eglWaitNative(EGLint engine) {
+        mg_egl_note_call(__func__);
         LOG_D("eglWaitNative, engine: %d", engine);
         LOAD_EGL(eglWaitNative)
         return egl_eglWaitNative(engine);
     }
 
     EGL_API EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
+        mg_egl_note_call(__func__);
         LOG_D("eglSwapBuffers, dpy: %p, surface: %p", dpy, surface);
         LOAD_EGL(eglSwapBuffers)
         EGLBoolean result;
@@ -451,6 +541,7 @@ extern "C"
     // swaps visible and feeds the same tracking as eglSwapBuffers.
     EGL_API EGLBoolean eglSwapBuffersWithDamageEXT(EGLDisplay dpy, EGLSurface surface, const EGLint* rects,
                                                    EGLint n_rects) {
+        mg_egl_note_call(__func__);
         LOG_D("eglSwapBuffersWithDamageEXT, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
         LOAD_EGL(eglSwapBuffersWithDamageEXT)
         if (!egl_eglSwapBuffersWithDamageEXT) {
@@ -469,6 +560,7 @@ extern "C"
 
     EGL_API EGLBoolean eglSwapBuffersWithDamageKHR(EGLDisplay dpy, EGLSurface surface, const EGLint* rects,
                                                    EGLint n_rects) {
+        mg_egl_note_call(__func__);
         LOG_D("eglSwapBuffersWithDamageKHR, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
         LOAD_EGL(eglSwapBuffersWithDamageKHR)
         if (!egl_eglSwapBuffersWithDamageKHR) {
@@ -485,20 +577,45 @@ extern "C"
     }
 
     EGL_API EGLBoolean eglCopyBuffers(EGLDisplay dpy, EGLSurface surface, EGLNativePixmapType target) {
+        mg_egl_note_call(__func__);
         LOG_D("eglCopyBuffers, dpy: %p, surface: %p, target: %p", dpy, surface, target);
         LOAD_EGL(eglCopyBuffers)
         return egl_eglCopyBuffers(dpy, surface, target);
     }
 
     EGL_API EGLDisplay eglGetPlatformDisplay(EGLenum platform, void* native_display, const EGLAttrib* attrib_list) {
+        mg_egl_note_call(__func__);
         LOG_D("eglGetPlatformDisplay, platform: %d, native_display: %p, attrib_list: "
               "%p",
               platform, native_display, attrib_list);
         LOAD_EGL(eglGetPlatformDisplay)
-        return egl_eglGetPlatformDisplay(platform, native_display, (const EGLint*)attrib_list);
+        if (!egl_eglGetPlatformDisplay) return EGL_NO_DISPLAY;
+        const std::vector<EGLint> narrow = NarrowAttribs(attrib_list);
+        return egl_eglGetPlatformDisplay(platform, native_display, narrow.empty() ? nullptr : narrow.data());
+    }
+
+    // The EXT variant takes EGLint attributes rather than EGLAttrib ones.
+    //
+    // Exported for the same reason as eglCreatePlatformWindowSurface below:
+    // this was declared but never exported, so an application resolving it
+    // through eglGetProcAddress — which forwards to dlsym(RTLD_DEFAULT, name) —
+    // got the HOST driver's version instead of this library's.
+    EGL_API EGLDisplay eglGetPlatformDisplayEXT(EGLenum platform, void* native_display, const EGLint* attrib_list) {
+        mg_egl_note_call(__func__);
+        LOG_W_FORCE("eglGetPlatformDisplayEXT, platform: %d, native_display: %p", platform, native_display);
+        LOAD_EGL(eglGetPlatformDisplayEXT)
+        if (egl_eglGetPlatformDisplayEXT) {
+            return egl_eglGetPlatformDisplayEXT(platform, native_display, attrib_list);
+        }
+        // Host lacks it: route through the EGL 1.5 entry point, which takes
+        // the wider attribute type. Widening EGLint -> EGLAttrib is lossless.
+        LOAD_EGL(eglGetPlatformDisplay)
+        if (!egl_eglGetPlatformDisplay) return EGL_NO_DISPLAY;
+        return egl_eglGetPlatformDisplay(platform, native_display, attrib_list);
     }
 
     EGL_API EGLAPI __eglMustCastToProperFunctionPointerType EGLAPIENTRY eglGetProcAddress(const char* procname) {
+        mg_egl_note_call(__func__);
         return reinterpret_cast<__eglMustCastToProperFunctionPointerType>(glXGetProcAddress(procname));
     }
 }

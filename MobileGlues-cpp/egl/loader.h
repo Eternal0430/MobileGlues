@@ -64,6 +64,9 @@ extern "C"
 
     typedef EGLDisplay (*eglGetPlatformDisplay_PTR)(EGLenum platform, void* native_display, const EGLint* attrib_list);
 
+
+    typedef EGLDisplay (*eglGetPlatformDisplayEXT_PTR)(EGLenum platform, void* native_display, const EGLint* attrib_list);
+
     typedef EGLint (*eglGetError_PTR)();
 
     typedef __eglMustCastToProperFunctionPointerType (*eglGetProcAddress_PTR)(const char* procname);
@@ -125,6 +128,7 @@ extern "C"
         eglGetCurrentSurface_PTR eglGetCurrentSurface;
         eglGetDisplay_PTR eglGetDisplay;
         eglGetPlatformDisplay_PTR eglGetPlatformDisplay;
+        eglGetPlatformDisplayEXT_PTR eglGetPlatformDisplayEXT;
         eglGetError_PTR eglGetError;
         eglGetProcAddress_PTR eglGetProcAddress;
         eglInitialize_PTR eglInitialize;
@@ -290,6 +294,11 @@ struct AppRenderTarget {
     // one context at a time, and a worker thread taking it would block the very
     // thread the picture depends on.
     pthread_t presenting_thread = 0;
+    // The thread the application bound its context on — normally the render
+    // thread. Recorded so the watchdog's per-thread breakdown can be read
+    // against it: whether the top caller IS the render thread decides whether
+    // the game is spinning or merely waiting.
+    pthread_t binding_thread = 0;
 };
 
 // Called from eglCreateWindowSurface: records the surface the application
@@ -310,6 +319,17 @@ void mg_egl_note_destroy_surface(EGLDisplay dpy, EGLSurface surface);
 // this library does not intercept, and using a dead one silently discards every
 // draw call.
 void mg_egl_forget_surface(EGLSurface surface);
+
+// Counts an application-initiated call to one of this library's EGL entry
+// points, into the same histogram as the guarded GL calls. The two are told
+// apart by name — every EGL entry point starts with "egl".
+//
+// The point is to see what the application is actually doing at the EGL level.
+// A session measured a render loop running at roughly 878 draws per second with
+// eglSwapBuffers never called even once, which cannot be diagnosed from inside
+// the GL layer: whether the application never asks to present, or asks through
+// an entry point this library does not export, is invisible without this.
+void mg_egl_note_call(const char* entry_point);
 
 // Called from eglSwapBuffers, for diagnostics.
 void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok);
