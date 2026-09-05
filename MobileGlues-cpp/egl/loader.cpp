@@ -211,17 +211,15 @@ thread_local unsigned t_seen_generation = 0;
 
 // Identifies the thread in logs. Several threads reach the fallback, and which
 // is which turned out to be the thing worth knowing.
+//
+// Deliberately not pthread_getname_np(): it is only declared from API 26 and
+// this project builds for minSdk 21, where using it is a hard error rather than
+// a warning. pthread_self() is available at every level, and it is the same
+// value eglMakeCurrent logs for the application's binding, so the two lines can
+// be compared directly to tell whether a fallback thread is the render thread.
 const char* CurrentThreadLabel() {
-    static thread_local char label[64];
-    if (label[0] == '\0') {
-        char name[32] = {};
-#if defined(__ANDROID__)
-        if (pthread_getname_np(pthread_self(), name, sizeof(name)) == 0 && name[0] != '\0')
-            snprintf(label, sizeof(label), "%s", name);
-        else
-#endif
-            snprintf(label, sizeof(label), "tid=%lu", (unsigned long)pthread_self());
-    }
+    static thread_local char label[48];
+    if (label[0] == '\0') snprintf(label, sizeof(label), "pthread=%lu", (unsigned long)pthread_self());
     return label;
 }
 
