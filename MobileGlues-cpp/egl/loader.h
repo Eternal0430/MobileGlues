@@ -350,6 +350,19 @@ void mg_egl_note_call(const char* entry_point);
 // Binding at creation time closes that gap without depending on SDL.
 void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface);
 
+// Called from this library's own eglSwapBuffers once the application presents
+// on its own. That turns off the present fallback below for good, because two
+// swap chains running at once would tear.
+//
+// The fallback exists because on this device the application never presents at
+// all: this library's eglSwapBuffers was called zero times in a session that
+// logged 1.4 million guarded GL calls, i.e. a render loop running flat out with
+// nothing ever reaching the screen. SDL resolves eglSwapBuffers with dlsym
+// rather than eglGetProcAddress — the names it does look up are logged, and
+// eglSwapBuffers is not among them — and what dlsym hands back is not this
+// library's entry point, so those swaps bypass everything here.
+void mg_egl_note_app_swap();
+
 // Called from eglSwapBuffers, for diagnostics.
 void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok);
 

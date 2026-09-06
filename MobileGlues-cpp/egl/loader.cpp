@@ -805,6 +805,89 @@ void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface) {
     }
 }
 
+namespace {
+
+// ---------------------------------------------------------------------------
+// Present fallback
+//
+// This library's eglSwapBuffers was called zero times during a session that
+// logged 1.4 million guarded GL calls — a render loop running flat out, drawing
+// into a surface that is never shown. The game is alive (audio and input work)
+// and the surface is correct: swapping it from here made the picture appear.
+//
+// SDL is the one that would normally present, and it does not. It resolves
+// eglSwapBuffers with dlsym rather than eglGetProcAddress, so the pointer it
+// calls is not this library's entry point and those swaps, if they happen at
+// all, go straight to the host and leave no trace here.
+//
+// Two things make this different from the earlier attempt that was reverted:
+//
+//   1. eglWaitGL() before the swap. Without it the swap presents whatever the
+//      GPU happens to have finished, which is a half-drawn frame — that was the
+//      flicker and the "two surfaces overlapping" look.
+//
+//   2. A hard interval instead of guessing where a frame ends. The previous
+//      version tried to detect frame boundaries by timing gaps and got it
+//      badly wrong: it logged "presented after 1 GL calls in that frame",
+//      because a 1.2 ms gap occurs *inside* a frame during texture uploads.
+//      A fixed interval plus the wait above presents whole frames.
+//
+// It stops permanently the moment the application presents on its own.
+// ---------------------------------------------------------------------------
+std::atomic<bool> g_present_fallback_active{true};
+
+// Only on the drawing thread, where the context and surface are current.
+thread_local std::chrono::steady_clock::time_point t_last_present{};
+
+// Roughly 60 Hz. eglSwapBuffers blocks on vsync when an interval is set, so
+// this is a cap rather than the actual rate.
+constexpr auto kPresentInterval = std::chrono::milliseconds(16);
+
+void MaybePresentFrame() {
+    if (!g_present_fallback_active.load(std::memory_order_acquire)) return;
+
+    const AppRenderTarget& t = mg_egl_app_target();
+    if (t.display == EGL_NO_DISPLAY) return;
+
+    // Prefer the surface this thread is actually drawing into; fall back to the
+    // most recent window surface the application created.
+    EGLSurface target = (t_fb.bound_surface != EGL_NO_SURFACE) ? t_fb.bound_surface : t.draw_surface;
+    if (target == EGL_NO_SURFACE) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (t_last_present.time_since_epoch().count() != 0 && now - t_last_present < kPresentInterval) return;
+
+    LOAD_EGL(eglSwapBuffers);
+    LOAD_EGL(eglWaitGL);
+    LOAD_EGL(eglGetError);
+    if (!egl_eglSwapBuffers) return;
+
+    // Finish everything issued so far, or the swap shows a half-drawn frame.
+    if (egl_eglWaitGL) egl_eglWaitGL();
+
+    t_last_present = now;
+    const EGLBoolean ok = egl_eglSwapBuffers(t.display, target);
+    if (ok != EGL_TRUE) {
+        LOG_W_FORCE("present fallback: eglSwapBuffers(%p) failed (0x%x) — the picture will not update", target,
+                    egl_eglGetError ? egl_eglGetError() : 0);
+        return;
+    }
+
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) == 0) {
+        LOG_W_FORCE("present fallback: the application never presents, so this library is swapping surface %p itself. "
+                    "This compensates for a missing swap, it does not replace a working one.",
+                    target);
+    }
+    mg_egl_note_swap(t.display, target, ok);
+}
+
+}  // namespace
+
+void mg_egl_note_app_swap() {
+    g_present_fallback_active.store(false, std::memory_order_release);
+}
+
 void mg_egl_note_call(const char* entry_point) {
     histogram_add(entry_point, pthread_self());
     if (!g_watchdog_started.exchange(true)) {
@@ -819,6 +902,7 @@ void mg_egl_note_guarded_call(const char* entry_point) {
     g_guarded_calls.fetch_add(1, std::memory_order_relaxed);
     histogram_add(entry_point, pthread_self());
     VerifyContextStillCurrent(t_calls);
+    MaybePresentFrame();
     if (!g_watchdog_started.exchange(true)) {
         // Detached and deliberately never joined: it outlives the GL session and
         // costs one wake-up every 20 seconds.
