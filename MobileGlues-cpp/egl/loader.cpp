@@ -714,36 +714,86 @@ void WatchdogLoop() {
 
 }  // namespace
 
-// Bind the application's context to a freshly created window surface, right
-// away, on whichever thread created it.
+// Bind a context to a freshly created window surface, right away, on whichever
+// thread created it.
 //
-// The precondition is a context to bind. If the application has not made one
-// current yet there is nothing to do, and the regular fallback in
-// BindFallbackEGLContextIfNeeded() will pick the surface up later — that path
-// already prefers t.draw_surface.
+// This is the MobileGL/DirectGLES model: DirectGLES::InitWindowSurface()
+// (MG_Backend/DirectGLES/DirectGLES.cpp) creates a window surface and then
+// immediately calls its own MakeCurrent() with its OWN global g_Context —
+// g_Surface = eglCreateWindowSurface(...); if (!MakeCurrent()) return false;
+// It does NOT wait for the application to make a context current first.
+// Therefore SDL reusing the primary window (creating a second surface before
+// the application has bound its context to this thread) cannot leave the
+// surface unbound. Measured on real hardware: without this, the second
+// surface was created but never bound, and the screen stayed black while
+// audio and buttons worked normally.
 //
-// A context that is current on some OTHER thread is left alone: EGL allows a
-// context to be current on one thread at a time, so a refused bind is the
-// correct outcome and stealing it would break the thread that already has it.
+// There are two cases:
+//
+// 1. The application already has a context bound somewhere (t.have_binding).
+//    Use it, exactly as before — but only if it is not current on another
+//    thread. A context current on another thread is left alone: EGL allows a
+//    context to be current on one thread at a time, and stealing it would
+//    break the thread that already has it.
+//
+// 2. No application context is bound yet (the SDL-reuse-window case). Fall
+//    back to this library's own startup context (eglContext, created in
+//    init_target_egl()). This is the key difference from the previous
+//    version, which simply returned here and left the surface orphaned.
+//    Binding our own context makes the surface a valid, current drawable so
+//    the game's GL calls have somewhere to land; when SDL later binds the
+//    application's context it will simply replace this binding.
 void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface) {
     if (surface == EGL_NO_SURFACE) return;
 
     const AppRenderTarget& t = mg_egl_app_target();
-    if (!t.have_binding || t.context == EGL_NO_CONTEXT) {
-        LOG_W_FORCE("window surface %p created, but the application has no context yet — the fallback will bind it "
-                    "later",
-                    surface);
-        return;
+
+    // Case 1: application context is available and lives on THIS thread.
+    if (t.have_binding && t.context != EGL_NO_CONTEXT) {
+        const EGLDisplay target_dpy = (t.display != EGL_NO_DISPLAY) ? t.display : dpy;
+        if (TryBind(target_dpy, t.context, surface, "activate the new window surface")) {
+            t_fb.ctx = t.context;
+            t_fb.bound_surface = surface;
+            t_fb.using_app_context = true;
+            LOG_W_FORCE("window surface %p bound to the application's context on pthread=%lu at creation time, so the "
+                        "swap chain is complete even if SDL never calls eglMakeCurrent for it",
+                        surface, (unsigned long)pthread_self());
+        } else {
+            LOG_W_FORCE("window surface %p could not be bound to the application's context on pthread=%lu — trying the "
+                        "library's own context instead",
+                        surface, (unsigned long)pthread_self());
+        }
+        // Fall through: even if the app context refused (e.g. current on
+        // another thread), bind OUR context below so the surface is never
+        // left orphaned.
     }
 
-    const EGLDisplay target_dpy = (t.display != EGL_NO_DISPLAY) ? t.display : dpy;
-    if (TryBind(target_dpy, t.context, surface, "activate the new window surface")) {
-        t_fb.ctx = t.context;
-        t_fb.bound_surface = surface;
-        t_fb.using_app_context = true;
-        LOG_W_FORCE("window surface %p bound to the application's context on pthread=%lu at creation time, so the "
-                    "swap chain is complete even if SDL never calls eglMakeCurrent for it",
-                    surface, (unsigned long)pthread_self());
+    // Case 2: bind this library's own context. MobileGL uses its single global
+    // g_Context for this; we cannot reuse eglContext directly because it may
+    // already be current on the init/startup thread, and MakeCurrent would then
+    // return EGL_BAD_ACCESS on this thread. So create a fresh per-thread context
+    // that shares with eglContext (resources created on either are visible to
+    // both) and bind THAT to the new surface. This is exactly the same shape as
+    // the thread contexts BindFallbackEGLContextIfNeeded() already creates, just
+    // done eagerly at surface creation rather than lazily on first GL call.
+    //
+    // Sharing with eglContext (rather than EGL_NO_CONTEXT) matters: any GL
+    // objects the library has already created on eglContext must remain visible
+    // once the game's rendering moves onto this surface.
+    if (eglContext != EGL_NO_CONTEXT) {
+        const EGLDisplay target_dpy = (t.display != EGL_NO_DISPLAY) ? t.display : eglDisplay;
+        if (CreateThreadContext(target_dpy, /*share=*/eglContext, surface)) {
+            // CreateThreadContext sets t_fb.ctx / share_with / bound_surface.
+            t_fb.using_app_context = false;  // not the app's context; may be migrated later
+            LOG_W_FORCE("window surface %p bound with a library-owned context (sharing with the startup context) on "
+                        "pthread=%lu — the surface is now a valid drawable even though the application has not bound "
+                        "its context yet (SDL window-reuse case)",
+                        surface, (unsigned long)pthread_self());
+        } else {
+            LOG_W_FORCE("window surface %p could not be bound: CreateThreadContext(share=eglContext, surface) failed on "
+                        "pthread=%lu — the surface remains unbound and may produce a black screen",
+                        surface, (unsigned long)pthread_self());
+        }
     }
 }
 
