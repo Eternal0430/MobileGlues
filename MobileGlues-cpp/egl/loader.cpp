@@ -859,6 +859,56 @@ thread_local bool t_gl_timestamps_primed = false;
 // of to the wall clock.
 thread_local unsigned long t_draws_since_present = 0;
 
+// Recent per-frame draw counts, used to recognise how big a frame is on this
+// machine. A handful of draws followed by a pause is NOT the end of a frame:
+// the log showed presentations after 2 and 3 draw calls, which split a single
+// frame into dozens of partial ones and produced the constant rolling back.
+//
+// Timing cannot tell the two apart here, because the application never swaps and
+// therefore never waits for vsync — frames run back to back, and the only gaps
+// are stalls inside a frame (texture and chunk uploads). So the count of draw
+// calls is the signal, and how many draws make a frame is learned at runtime
+// rather than guessed: it varies with view distance, dimension and scene.
+constexpr unsigned kDrawHistorySize = 8;
+thread_local unsigned long t_draw_history[kDrawHistorySize] = {0};
+thread_local unsigned t_draw_history_next = 0;
+
+// Recent gaps between consecutive GL calls, in microseconds. The largest of
+// them approximates the frame boundary, and it ages out on its own as the ring
+// fills — so one unusually long stall (a loading hitch) raises the bar only
+// briefly instead of permanently.
+constexpr unsigned kGapHistorySize = 32;
+thread_local long long t_gap_history_us[kGapHistorySize] = {0};
+thread_local unsigned t_gap_history_next = 0;
+
+long long RecentMaxGapUs() {
+    long long largest = 0;
+    for (unsigned i = 0; i < kGapHistorySize; ++i) {
+        if (t_gap_history_us[i] > largest) largest = t_gap_history_us[i];
+    }
+    return largest;
+}
+
+void RecordGapUs(long long gap_us) {
+    t_gap_history_us[t_gap_history_next] = gap_us;
+    t_gap_history_next = (t_gap_history_next + 1) % kGapHistorySize;
+}
+
+// Largest frame seen recently. Frames are consistent in size, so anything well
+// below this is a partially drawn frame.
+unsigned long RecentMaxDrawsPerFrame() {
+    unsigned long largest = 0;
+    for (unsigned i = 0; i < kDrawHistorySize; ++i) {
+        if (t_draw_history[i] > largest) largest = t_draw_history[i];
+    }
+    return largest;
+}
+
+void RecordDrawsPerFrame(unsigned long draws) {
+    t_draw_history[t_draw_history_next] = draws;
+    t_draw_history_next = (t_draw_history_next + 1) % kDrawHistorySize;
+}
+
 // A gap this wide between two consecutive GL calls means the renderer stopped
 // issuing work — the previous frame is complete and a new one has not started.
 // Inside a frame the calls are microseconds apart; between frames the thread
@@ -911,6 +961,34 @@ void MaybePresentFrame() {
     // buffer the game had not rewritten — an older frame.
     if (t_draws_since_present == 0) return;
 
+    // A pause alone is not enough: it also has to be a *frame-sized* pause.
+    // Intra-frame stalls (texture and chunk uploads) are a few milliseconds;
+    // the gap at a frame boundary is the largest one around, because that is
+    // where game logic and event polling happen. So the threshold is derived
+    // from the largest gaps seen recently rather than being a fixed constant.
+    //
+    // The rate was already right — the log shows ~60 presents per second, about
+    // one per frame — so the remaining fault is phase, not frequency: a swap
+    // landing mid-frame splits that frame across two buffers, and the screen
+    // alternates between the two halves. Aligning to the largest recent gap is
+    // what fixes the phase.
+    //
+    // Gap, not draw count, is the signal here for a practical reason: it can be
+    // measured continuously, so it needs no correct answer to get started.
+    // A draw-count threshold can only be learned by presenting first, and it
+    // locks onto whatever the first (small, loading-screen) frames happened to
+    // be — which is how an earlier attempt at this ended up demanding more
+    // draws than a real frame ever issues, and stalling to 10 fps.
+    if (!overdue) {
+        const long long largest = RecentMaxGapUs();
+        if (largest > 0) {
+            const long long required_us = (largest * 3) / 5;
+            const auto gap_us = std::chrono::duration_cast<std::chrono::microseconds>(t_last_gl_call - t_prev_gl_call)
+                                    .count();
+            if (gap_us < required_us) return;
+        }
+    }
+
     LOAD_EGL(eglSwapBuffers);
     LOAD_EGL(eglWaitGL);
     LOAD_EGL(eglGetError);
@@ -922,6 +1000,7 @@ void MaybePresentFrame() {
     t_last_present = now;
     const unsigned long draws = t_draws_since_present;
     t_draws_since_present = 0;
+    RecordDrawsPerFrame(draws);
     const EGLBoolean ok = egl_eglSwapBuffers(t.display, target);
     if (ok != EGL_TRUE) {
         LOG_W_FORCE("present fallback: eglSwapBuffers(%p) failed (0x%x) — the picture will not update", target,
@@ -987,6 +1066,7 @@ void mg_egl_note_guarded_call(const char* entry_point) {
             t_prev_gl_call = now;
         } else {
             t_prev_gl_call = t_last_gl_call;
+            RecordGapUs(std::chrono::duration_cast<std::chrono::microseconds>(now - t_prev_gl_call).count());
         }
         t_last_gl_call = now;
     }

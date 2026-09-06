@@ -1194,6 +1194,17 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
         if (global_settings.buffer_coherent_as_flush &&
             ((flags & GL_MAP_PERSISTENT_BIT) != 0 || (flags & GL_DYNAMIC_STORAGE_BIT) != 0))
             flags |= (GL_MAP_WRITE_BIT | GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT);
+
+        // Clear any pending error before this call, otherwise the check below
+        // reports an error left by earlier, unrelated work and the allocation is
+        // blamed for something it did not do. This very log showed a rejection
+        // with flags=0x102 (DYNAMIC_STORAGE|WRITE), a combination the driver
+        // accepts everywhere else — the report was stale, not real.
+        if (GLES.glGetError) {
+            for (int drain = 0; drain < 8; ++drain) {
+                if (GLES.glGetError() == GL_NO_ERROR) break;
+            }
+        }
         GLES.glBufferStorageEXT(target, size, data, flags);
 
         // CHECK_GL_ERROR compiles to nothing in release builds, so a rejected
