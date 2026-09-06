@@ -844,9 +844,32 @@ std::atomic<unsigned long> g_present_fallback_swaps{0};
 // Only on the drawing thread, where the context and surface are current.
 thread_local std::chrono::steady_clock::time_point t_last_present{};
 
-// Roughly 60 Hz. eglSwapBuffers blocks on vsync when an interval is set, so
-// this is a cap rather than the actual rate.
-constexpr auto kPresentInterval = std::chrono::milliseconds(16);
+// The two most recent guarded-GL-call timestamps on this thread. Their
+// difference is the gap *into* the current call, and that gap is the only signal
+// available for where one frame ends and the next begins.
+thread_local std::chrono::steady_clock::time_point t_prev_gl_call{};
+thread_local std::chrono::steady_clock::time_point t_last_gl_call{};
+thread_local bool t_gl_timestamps_primed = false;
+
+// A gap this wide between two consecutive GL calls means the renderer stopped
+// issuing work — the previous frame is complete and a new one has not started.
+// Inside a frame the calls are microseconds apart; between frames the thread
+// waits on vsync, runs game logic and polls events.
+//
+// The earlier attempt used 1.2 ms and was wrong: a texture upload leaves a gap
+// of that size *inside* a frame, so it fired dozens of times per frame and
+// presented half-finished frames. 4 ms is above any intra-frame stall and below
+// the idle time of a frame boundary at any playable frame rate.
+constexpr auto kQuietPeriod = std::chrono::microseconds(4000);
+
+// Floor on the presentation rate, so a quiet period cannot be followed by a
+// burst of swaps.
+constexpr auto kMinPresentInterval = std::chrono::microseconds(6000);
+
+// Ceiling on how long to go without presenting. If the renderer never goes
+// quiet — a continuous loop with no idle — presenting late is still better than
+// never presenting at all, which is what a black screen is.
+constexpr auto kMaxPresentLatency = std::chrono::milliseconds(100);
 
 void MaybePresentFrame() {
     if (!g_present_fallback_active.load(std::memory_order_acquire)) return;
@@ -860,7 +883,18 @@ void MaybePresentFrame() {
     if (target == EGL_NO_SURFACE) return;
 
     const auto now = std::chrono::steady_clock::now();
-    if (t_last_present.time_since_epoch().count() != 0 && now - t_last_present < kPresentInterval) return;
+
+    if (t_last_present.time_since_epoch().count() != 0 && now - t_last_present < kMinPresentInterval) return;
+
+    // Present only at a moment when the renderer has stopped issuing work.
+    // The gap into the current call is measured between the two most recent
+    // calls, not between now and the previous one: this function runs as part of
+    // the current call, so "now" is that call and the gap would always be zero.
+    const bool primed = t_gl_timestamps_primed;
+    const bool quiet = primed && (t_last_gl_call - t_prev_gl_call) >= kQuietPeriod;
+    const bool overdue =
+        !primed || (t_last_present.time_since_epoch().count() != 0 && now - t_last_present >= kMaxPresentLatency);
+    if (!quiet && !overdue) return;
 
     LOAD_EGL(eglSwapBuffers);
     LOAD_EGL(eglWaitGL);
@@ -885,12 +919,13 @@ void MaybePresentFrame() {
                     target);
     }
     if (n == 1 || n == 60 || n == 600) {
-        LOG_W_FORCE("present fallback: %lu swaps so far%s", n,
+        LOG_W_FORCE("present fallback: %lu swaps so far (this one on %s)%s", n,
+                    quiet ? "a quiet period — the frame looked complete" : "the latency ceiling — frame may be partial",
                     g_present_fallback_active.load(std::memory_order_acquire)
                         ? " — still active, so the application is not presenting"
                         : " — already stopped, so the application took over presenting");
     }
-    mg_egl_note_swap(t.display, target, ok);
+    mg_egl_note_swap(t.display, target, ok, /*from_fallback=*/true);
 }
 
 }  // namespace
@@ -916,6 +951,20 @@ void mg_egl_note_guarded_call(const char* entry_point) {
     g_guarded_calls.fetch_add(1, std::memory_order_relaxed);
     histogram_add(entry_point, pthread_self());
     VerifyContextStillCurrent(t_calls);
+
+    // Slide the call timestamps before the fallback reads them: it runs inside
+    // this call, so the gap it must judge is the one leading into it.
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (!t_gl_timestamps_primed) {
+            t_gl_timestamps_primed = true;
+            t_prev_gl_call = now;
+        } else {
+            t_prev_gl_call = t_last_gl_call;
+        }
+        t_last_gl_call = now;
+    }
+
     MaybePresentFrame();
     if (!g_watchdog_started.exchange(true)) {
         // Detached and deliberately never joined: it outlives the GL session and

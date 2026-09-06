@@ -164,7 +164,13 @@ void mg_egl_forget_surface(EGLSurface surface) {
     LOG_W_FORCE("forgot surface %p after the driver rejected it — it will not be used again", surface);
 }
 
-void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok) {
+// from_fallback says who actually presented. Without it the log below claims
+// "the application presents from" even when this library's own fallback did the
+// swap, because the two are indistinguishable from inside this function. That
+// misread sent several rounds of debugging down the wrong path: the line
+// appeared in a log where the fallback counter kept climbing, which looks like a
+// working swap chain although the application had never presented at all.
+void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok, bool from_fallback) {
     if (ok != EGL_TRUE || surface == EGL_NO_SURFACE) return;
 
     std::lock_guard<std::mutex> lock(g_target_mutex);
@@ -186,9 +192,10 @@ void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok) {
             g_target.have_surface = true;
         }
         g_target_generation.fetch_add(1, std::memory_order_acq_rel);
-        LOG_W_FORCE("eglSwapBuffers: this is the surface the application presents from: %p, presented by "
+        LOG_W_FORCE("eglSwapBuffers: this is the surface %s presents from: %p, presented by "
                     "pthread=%lu%s",
-                    surface, (unsigned long)pthread_self(), first ? "" : " (changed from the previous one)");
+                    from_fallback ? "the PRESENT FALLBACK" : "the application", surface,
+                    (unsigned long)pthread_self(), first ? "" : " (changed from the previous one)");
     } else if (g_target.presenting_thread != 0 && !pthread_equal(g_target.presenting_thread, pthread_self())) {
         // Worth reporting: if the presenting thread moves, the render thread
         // inferred from the first swap is no longer the one that matters.

@@ -364,7 +364,7 @@ void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface);
 void mg_egl_note_app_swap();
 
 // Called from eglSwapBuffers, for diagnostics.
-void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok);
+void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok, bool from_fallback = false);
 
 const AppRenderTarget& mg_egl_app_target();
 
