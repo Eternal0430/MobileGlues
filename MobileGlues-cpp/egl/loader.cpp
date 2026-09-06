@@ -744,16 +744,53 @@ namespace {
 std::atomic<bool> g_forced_swap_active{true};
 
 // Only on the drawing thread, which is where the context and surface are
-// current. Swapping from the watchdog thread would race with drawing.
-thread_local std::chrono::steady_clock::time_point t_last_forced_swap{};
+// current. Swapping from another thread would either race with drawing or
+// flush the wrong context.
+struct FrameClock {
+    std::chrono::steady_clock::time_point last_call{};
+    std::chrono::steady_clock::time_point last_swap{};
+    unsigned long calls_since_swap = 0;
+    bool primed = false;
+    // Set once a gap between frames has actually been observed. While it is
+    // false there is no frame boundary to present on, so the timed fallback is
+    // used instead; once a boundary has been seen, the timed path is switched
+    // off permanently so it cannot later present in the middle of a frame.
+    bool gap_seen = false;
+};
+
+thread_local FrameClock t_frame;
+
+// A gap this long between consecutive GL calls means the previous frame
+// finished and a new one has begun. Well under one frame at 60 Hz, and far
+// above the sub-microsecond spacing between calls inside a frame.
+constexpr auto kFrameGap = std::chrono::microseconds(1200);
+
+// Only used until a frame boundary is first observed. If none ever is, the
+// render loop never pauses and something must present regardless.
+constexpr auto kMaxLatency = std::chrono::milliseconds(32);
 
 void MaybeForceSwap() {
     if (!g_forced_swap_active.load(std::memory_order_acquire)) return;
 
-    // Roughly 60 Hz. Anything faster is wasted work; slower visibly stutters.
-    constexpr auto kInterval = std::chrono::milliseconds(16);
     const auto now = std::chrono::steady_clock::now();
-    if (t_last_forced_swap.time_since_epoch().count() != 0 && now - t_last_forced_swap < kInterval) return;
+
+    FrameClock& fc = t_frame;
+    if (!fc.primed) {
+        fc.primed = true;
+        fc.last_call = now;
+        fc.last_swap = now;
+        return;
+    }
+
+    const bool new_frame = (now - fc.last_call) >= kFrameGap;
+    const bool overdue = !fc.gap_seen && (now - fc.last_swap) >= kMaxLatency;
+    fc.last_call = now;
+    ++fc.calls_since_swap;
+
+    // Nothing has been drawn since the last presentation — presenting again
+    // would just show the same frame twice.
+    if (fc.calls_since_swap == 0) return;
+    if (!new_frame && !overdue) return;
 
     const AppRenderTarget& t = mg_egl_app_target();
     if (t.display == EGL_NO_DISPLAY) return;
@@ -766,16 +803,27 @@ void MaybeForceSwap() {
     LOAD_EGL(eglSwapBuffers);
     if (!egl_eglSwapBuffers) return;
 
-    t_last_forced_swap = now;
     const EGLBoolean ok = egl_eglSwapBuffers(t.display, target);
+    const unsigned long calls = fc.calls_since_swap;
+    fc.last_swap = now;
+    fc.calls_since_swap = 0;
     if (ok != EGL_TRUE) return;
 
+    if (new_frame) fc.gap_seen = true;
+
     static std::atomic<int> logged{0};
-    if (logged.fetch_add(1, std::memory_order_relaxed) == 0) {
+    const int n = logged.fetch_add(1, std::memory_order_relaxed);
+    if (n == 0) {
         LOG_W_FORCE("forced swap: the application never calls eglSwapBuffers, so this library is presenting surface "
                     "%p itself. This is a fallback for a broken swap chain, not a fix for it.",
                     target);
     }
+    if (n < 5 || n == 20 || n == 100) {
+        LOG_W_FORCE("forced swap #%d: presented on %s after %lu GL calls in that frame%s", n,
+                    new_frame ? "a frame boundary" : "the timed fallback", calls,
+                    new_frame ? "" : " — no frame boundary has been observed yet");
+    }
+
     mg_egl_note_swap(t.display, target, ok);
 }
 
