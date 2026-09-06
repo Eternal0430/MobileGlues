@@ -539,6 +539,10 @@ extern "C"
             LOAD_EGL(eglGetError)
             LOG_W_FORCE("eglSwapBuffers: FAILED (0x%x) surface=%p", egl_eglGetError(), surface);
         }
+        // The application presented on its own, so the forced-swap fallback
+        // has nothing left to do. Turned off permanently: if a real swap chain
+        // is working, adding a second one would only cause tearing.
+        mg_egl_note_app_swap();
         mg_egl_note_swap(dpy, surface, result);
         return result;
     }

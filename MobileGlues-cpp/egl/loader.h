@@ -331,6 +331,11 @@ void mg_egl_forget_surface(EGLSurface surface);
 // an entry point this library does not export, is invisible without this.
 void mg_egl_note_call(const char* entry_point);
 
+// Called from this library's eglSwapBuffers once the application presents on
+// its own. That turns off the forced-swap fallback below, which exists only for
+// the case where the application never presents at all.
+void mg_egl_note_app_swap();
+
 // Called from eglSwapBuffers, for diagnostics.
 void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok);
 

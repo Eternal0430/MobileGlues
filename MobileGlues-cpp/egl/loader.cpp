@@ -714,6 +714,77 @@ void WatchdogLoop() {
 
 }  // namespace
 
+namespace {
+
+// ---------------------------------------------------------------------------
+// Forced-swap fallback
+//
+// Added after a real log showed the whole chain broken one link short:
+//
+//     eglCreateWindowSurface -> 0x77ac21a200
+//     eglMakeCurrent         -> bound 0x77ac21a200        (first window, fine)
+//     SDL_Hook: reusing primary window, refs=2
+//     eglMakeCurrent         -> released
+//     eglDestroySurface      -> 0x77ac21a200 destroyed
+//     eglCreateWindowSurface -> 0x77ac53a980
+//     eglMakeCurrent         -> (never)
+//     eglSwapBuffers         -> (never, not once)
+//
+// SDL creates the second surface and then stops. It never makes it current, so
+// its own window bookkeeping has nothing to present and it skips the swap
+// entirely — silently, with no error. Meanwhile the game keeps drawing at a few
+// thousand GL calls per second into a surface that is never shown.
+//
+// This presents that surface from the drawing thread instead, at roughly
+// display refresh rate, until the application presents on its own. It is a
+// fallback for a broken swap chain, not a replacement for a working one: the
+// moment a real eglSwapBuffers arrives, mg_egl_note_app_swap() turns it off for
+// good.
+// ---------------------------------------------------------------------------
+std::atomic<bool> g_forced_swap_active{true};
+
+// Only on the drawing thread, which is where the context and surface are
+// current. Swapping from the watchdog thread would race with drawing.
+thread_local std::chrono::steady_clock::time_point t_last_forced_swap{};
+
+void MaybeForceSwap() {
+    if (!g_forced_swap_active.load(std::memory_order_acquire)) return;
+
+    // Roughly 60 Hz. Anything faster is wasted work; slower visibly stutters.
+    constexpr auto kInterval = std::chrono::milliseconds(16);
+    const auto now = std::chrono::steady_clock::now();
+    if (t_last_forced_swap.time_since_epoch().count() != 0 && now - t_last_forced_swap < kInterval) return;
+
+    const AppRenderTarget& t = mg_egl_app_target();
+    if (t.display == EGL_NO_DISPLAY) return;
+
+    // Prefer the surface this thread is actually drawing into; fall back to the
+    // most recent window surface the application created.
+    EGLSurface target = (t_fb.bound_surface != EGL_NO_SURFACE) ? t_fb.bound_surface : t.draw_surface;
+    if (target == EGL_NO_SURFACE) return;
+
+    LOAD_EGL(eglSwapBuffers);
+    if (!egl_eglSwapBuffers) return;
+
+    t_last_forced_swap = now;
+    const EGLBoolean ok = egl_eglSwapBuffers(t.display, target);
+    if (ok != EGL_TRUE) return;
+
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) == 0) {
+        LOG_W_FORCE("forced swap: the application never calls eglSwapBuffers, so this library is presenting surface "
+                    "%p itself. This is a fallback for a broken swap chain, not a fix for it.",
+                    target);
+    }
+    mg_egl_note_swap(t.display, target, ok);
+}
+
+}  // namespace
+
+void mg_egl_note_app_swap() {
+    g_forced_swap_active.store(false, std::memory_order_release);
+}
+
 void mg_egl_note_call(const char* entry_point) {
     histogram_add(entry_point, pthread_self());
     if (!g_watchdog_started.exchange(true)) {
@@ -728,6 +799,7 @@ void mg_egl_note_guarded_call(const char* entry_point) {
     g_guarded_calls.fetch_add(1, std::memory_order_relaxed);
     histogram_add(entry_point, pthread_self());
     VerifyContextStillCurrent(t_calls);
+    MaybeForceSwap();
     if (!g_watchdog_started.exchange(true)) {
         // Detached and deliberately never joined: it outlives the GL session and
         // costs one wake-up every 20 seconds.
