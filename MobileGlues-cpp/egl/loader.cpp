@@ -836,6 +836,11 @@ namespace {
 // ---------------------------------------------------------------------------
 std::atomic<bool> g_present_fallback_active{true};
 
+// Counted so a log can prove whether two swap chains ever ran at once. That is
+// the question behind the "picture rolls back" symptom, and it cannot be
+// answered from the picture itself.
+std::atomic<unsigned long> g_present_fallback_swaps{0};
+
 // Only on the drawing thread, where the context and surface are current.
 thread_local std::chrono::steady_clock::time_point t_last_present{};
 
@@ -873,11 +878,17 @@ void MaybePresentFrame() {
         return;
     }
 
-    static std::atomic<int> logged{0};
-    if (logged.fetch_add(1, std::memory_order_relaxed) == 0) {
+    const unsigned long n = g_present_fallback_swaps.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1) {
         LOG_W_FORCE("present fallback: the application never presents, so this library is swapping surface %p itself. "
                     "This compensates for a missing swap, it does not replace a working one.",
                     target);
+    }
+    if (n == 1 || n == 60 || n == 600) {
+        LOG_W_FORCE("present fallback: %lu swaps so far%s", n,
+                    g_present_fallback_active.load(std::memory_order_acquire)
+                        ? " — still active, so the application is not presenting"
+                        : " — already stopped, so the application took over presenting");
     }
     mg_egl_note_swap(t.display, target, ok);
 }
@@ -885,7 +896,10 @@ void MaybePresentFrame() {
 }  // namespace
 
 void mg_egl_note_app_swap() {
-    g_present_fallback_active.store(false, std::memory_order_release);
+    if (g_present_fallback_active.exchange(false, std::memory_order_acq_rel)) {
+        LOG_W_FORCE("present fallback: stopping after %lu swaps, because the application is presenting on its own now",
+                    g_present_fallback_swaps.load(std::memory_order_relaxed));
+    }
 }
 
 void mg_egl_note_call(const char* entry_point) {

@@ -578,6 +578,16 @@ extern "C"
             LOAD_EGL(eglGetError)
             LOG_W_FORCE("eglSwapBuffersWithDamageEXT: FAILED (0x%x) surface=%p", egl_eglGetError(), surface);
         }
+        // The application presented on its own, so the present fallback must
+        // stop — same as in eglSwapBuffers. Omitting this was the direct cause
+        // of the "picture rolls back" flicker: once self-promotion made the
+        // application's swap resolve to this library, SDL presented through
+        // this entry point while the fallback was still presenting from the
+        // drawing thread, so each frame reached the screen twice at different
+        // points in time. A static screen hides it (both presents show the same
+        // content); the moment the camera moves, the two presents carry
+        // different frames and the view snaps backwards.
+        mg_egl_note_app_swap();
         mg_egl_note_swap(dpy, surface, result);
         return result;
     }
@@ -597,6 +607,9 @@ extern "C"
             LOAD_EGL(eglGetError)
             LOG_W_FORCE("eglSwapBuffersWithDamageKHR: FAILED (0x%x) surface=%p", egl_eglGetError(), surface);
         }
+        // See the note in eglSwapBuffersWithDamageEXT: stopping the present
+        // fallback here is what keeps two swap chains from running at once.
+        mg_egl_note_app_swap();
         mg_egl_note_swap(dpy, surface, result);
         return result;
     }
