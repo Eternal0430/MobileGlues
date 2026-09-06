@@ -336,6 +336,25 @@ void mg_egl_note_call(const char* entry_point);
 // the case where the application never presents at all.
 void mg_egl_note_app_swap();
 
+// Called right after a window surface is created, to bind the application's
+// context to it on the spot.
+//
+// This is how MobileGL's DirectGLES backend avoids the whole class of problem
+// the rest of this file exists to work around. Its CreateEGLWindowSurface() is
+// RegisterEGLWindowSurface() AND ActivateEGLSurface(); ActivateEGLSurface()
+// ends in InitWindowSurface(), which creates the surface and then calls
+// MakeCurrent() itself. A surface is therefore never left unbound waiting for
+// the application to come back and bind it.
+//
+// Here, by contrast, eglCreateWindowSurface only records the surface. When SDL
+// reuses its primary window it creates a second surface and never calls
+// eglMakeCurrent for it, so nothing is ever bound to the surface that ends up
+// on screen and the swap chain quietly breaks: the game draws at a few thousand
+// GL calls per second into a surface that is never presented.
+//
+// Binding at creation time closes that gap without depending on SDL.
+void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface);
+
 // Called from eglSwapBuffers, for diagnostics.
 void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok);
 

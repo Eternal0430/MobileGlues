@@ -298,6 +298,7 @@ extern "C"
         LOAD_EGL(eglCreateWindowSurface)
         EGLSurface surf = egl_eglCreateWindowSurface(dpy, config, win, attrib_list);
         mg_egl_note_window_surface(dpy, config, surf);
+        mg_egl_activate_window_surface(dpy, surf);
         return surf;
     }
 
@@ -331,6 +332,7 @@ extern "C"
         EGLSurface surf =
             egl_eglCreatePlatformWindowSurface(dpy, config, native_window, narrow.empty() ? nullptr : narrow.data());
         mg_egl_note_window_surface(dpy, config, surf);
+        mg_egl_activate_window_surface(dpy, surf);
         return surf;
     }
 

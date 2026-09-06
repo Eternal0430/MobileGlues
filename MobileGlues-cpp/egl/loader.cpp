@@ -833,6 +833,39 @@ void mg_egl_note_app_swap() {
     g_forced_swap_active.store(false, std::memory_order_release);
 }
 
+// Bind the application's context to a freshly created window surface, right
+// away, on whichever thread created it.
+//
+// The precondition is a context to bind. If the application has not made one
+// current yet there is nothing to do, and the regular fallback in
+// BindFallbackEGLContextIfNeeded() will pick the surface up later — that path
+// already prefers t.draw_surface.
+//
+// A context that is current on some OTHER thread is left alone: EGL allows a
+// context to be current on one thread at a time, so a refused bind is the
+// correct outcome and stealing it would break the thread that already has it.
+void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface) {
+    if (surface == EGL_NO_SURFACE) return;
+
+    const AppRenderTarget& t = mg_egl_app_target();
+    if (!t.have_binding || t.context == EGL_NO_CONTEXT) {
+        LOG_W_FORCE("window surface %p created, but the application has no context yet — the fallback will bind it "
+                    "later",
+                    surface);
+        return;
+    }
+
+    const EGLDisplay target_dpy = (t.display != EGL_NO_DISPLAY) ? t.display : dpy;
+    if (TryBind(target_dpy, t.context, surface, "activate the new window surface")) {
+        t_fb.ctx = t.context;
+        t_fb.bound_surface = surface;
+        t_fb.using_app_context = true;
+        LOG_W_FORCE("window surface %p bound to the application's context on pthread=%lu at creation time, so the "
+                    "swap chain is complete even if SDL never calls eglMakeCurrent for it",
+                    surface, (unsigned long)pthread_self());
+    }
+}
+
 void mg_egl_note_call(const char* entry_point) {
     histogram_add(entry_point, pthread_self());
     if (!g_watchdog_started.exchange(true)) {
