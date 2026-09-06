@@ -728,21 +728,22 @@ void WatchdogLoop() {
 // surface was created but never bound, and the screen stayed black while
 // audio and buttons worked normally.
 //
-// There are two cases:
+// There are two cases, and they are MUTUALLY EXCLUSIVE — case 1 returns on
+// success and must never be followed by case 2 (see the note at the return).
 //
 // 1. The application already has a context bound somewhere (t.have_binding).
-//    Use it, exactly as before — but only if it is not current on another
-//    thread. A context current on another thread is left alone: EGL allows a
-//    context to be current on one thread at a time, and stealing it would
-//    break the thread that already has it.
+//    Use it — but only if it is not current on another thread. A context
+//    current on another thread is left alone: EGL allows a context to be
+//    current on one thread at a time, and stealing it would break the thread
+//    that already has it.
 //
-// 2. No application context is bound yet (the SDL-reuse-window case). Fall
-//    back to this library's own startup context (eglContext, created in
-//    init_target_egl()). This is the key difference from the previous
-//    version, which simply returned here and left the surface orphaned.
-//    Binding our own context makes the surface a valid, current drawable so
-//    the game's GL calls have somewhere to land; when SDL later binds the
-//    application's context it will simply replace this binding.
+// 2. No application context is bound yet (the SDL-reuse-window case), or the
+//    application's context refused the surface. Fall back to this library's
+//    own startup context (eglContext, created in init_target_egl()). This is
+//    the key difference from the original version, which simply returned here
+//    and left the surface orphaned. Binding our own context makes the surface
+//    a valid, current drawable so the game's GL calls have somewhere to land;
+//    when SDL later binds the application's context it simply replaces it.
 void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface) {
     if (surface == EGL_NO_SURFACE) return;
 
@@ -758,14 +759,21 @@ void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface) {
             LOG_W_FORCE("window surface %p bound to the application's context on pthread=%lu at creation time, so the "
                         "swap chain is complete even if SDL never calls eglMakeCurrent for it",
                         surface, (unsigned long)pthread_self());
-        } else {
-            LOG_W_FORCE("window surface %p could not be bound to the application's context on pthread=%lu — trying the "
-                        "library's own context instead",
-                        surface, (unsigned long)pthread_self());
+            // STOP HERE. Falling through to case 2 was a regression: it called
+            // CreateThreadContext for the SAME surface already bound above, and
+            // that issues another eglMakeCurrent for a surface the application's
+            // context now holds. The call fails (EGL_BAD_MATCH / BAD_ACCESS), and
+            // on this driver a failing MakeCurrent still disturbs the draw
+            // binding — the session that had this fall-through logged a
+            // successful activate followed by "CreateThreadContext failed", and
+            // eglSwapBuffers then never ran once, black screen. The session
+            // without the fall-through bound the same surface and the
+            // application swapped normally.
+            return;
         }
-        // Fall through: even if the app context refused (e.g. current on
-        // another thread), bind OUR context below so the surface is never
-        // left orphaned.
+        LOG_W_FORCE("window surface %p could not be bound to the application's context on pthread=%lu — trying the "
+                    "library's own context instead",
+                    surface, (unsigned long)pthread_self());
     }
 
     // Case 2: bind this library's own context. MobileGL uses its single global
