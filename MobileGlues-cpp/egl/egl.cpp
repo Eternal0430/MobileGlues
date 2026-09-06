@@ -614,8 +614,95 @@ extern "C"
         return egl_eglGetPlatformDisplay(platform, native_display, attrib_list);
     }
 
-    EGL_API EGLAPI __eglMustCastToProperFunctionPointerType EGLAPIENTRY eglGetProcAddress(const char* procname) {
+        // ---------------------------------------------------------------------------
+    // eglGetProcAddress: what this library hands back
+    //
+    // It used to forward everything to glXGetProcAddress, which is a bare
+    // dlsym(RTLD_DEFAULT, name). RTLD_DEFAULT searches only the GLOBAL symbol
+    // scope, and a launcher that loads this library with dlopen(path,
+    // RTLD_LOCAL) — the default — puts none of its symbols there. The lookup
+    // then falls through to the host driver's libEGL.so and hands the
+    // application the HOST's function, so that call bypasses this library
+    // completely: no log, no tracking, no wrapper.
+    //
+    // The measurement says exactly that is happening. A session logged 297k
+    // guarded GL calls in 20 seconds at roughly 878 draws per second — the
+    // render loop running flat out — while eglSwapBuffers was never called
+    // once. Whatever the application uses to present is not reaching this
+    // library, and eglGetProcAddress is the only place it could have obtained
+    // such a pointer.
+    //
+    // MobileGL gets this right by construction: GetProcAddress.cpp answers
+    // through an explicit GETPROC table of its own entry points. This is the
+    // same fix.
+    //
+    // Answering for our own entry points first is also just correct: a library
+    // that intercepts EGL must hand out the interception, not the thing it
+    // wraps, or the interception only works for callers that link directly.
+    // ---------------------------------------------------------------------------
+    namespace {
+    struct EglExport {
+        const char* name;
+        void* address;
+    };
+
+    const EglExport kEglExports[] = {
+        {"eglBindAPI", reinterpret_cast<void*>(&::eglBindAPI)},
+        {"eglBindTexImage", reinterpret_cast<void*>(&::eglBindTexImage)},
+        {"eglChooseConfig", reinterpret_cast<void*>(&::eglChooseConfig)},
+        {"eglCopyBuffers", reinterpret_cast<void*>(&::eglCopyBuffers)},
+        {"eglCreateContext", reinterpret_cast<void*>(&::eglCreateContext)},
+        {"eglCreatePbufferFromClientBuffer", reinterpret_cast<void*>(&::eglCreatePbufferFromClientBuffer)},
+        {"eglCreatePbufferSurface", reinterpret_cast<void*>(&::eglCreatePbufferSurface)},
+        {"eglCreatePixmapSurface", reinterpret_cast<void*>(&::eglCreatePixmapSurface)},
+        {"eglCreatePlatformWindowSurface", reinterpret_cast<void*>(&::eglCreatePlatformWindowSurface)},
+        {"eglCreateWindowSurface", reinterpret_cast<void*>(&::eglCreateWindowSurface)},
+        {"eglDestroyContext", reinterpret_cast<void*>(&::eglDestroyContext)},
+        {"eglDestroySurface", reinterpret_cast<void*>(&::eglDestroySurface)},
+        {"eglGetConfigAttrib", reinterpret_cast<void*>(&::eglGetConfigAttrib)},
+        {"eglGetConfigs", reinterpret_cast<void*>(&::eglGetConfigs)},
+        {"eglGetCurrentContext", reinterpret_cast<void*>(&::eglGetCurrentContext)},
+        {"eglGetCurrentDisplay", reinterpret_cast<void*>(&::eglGetCurrentDisplay)},
+        {"eglGetCurrentSurface", reinterpret_cast<void*>(&::eglGetCurrentSurface)},
+        {"eglGetDisplay", reinterpret_cast<void*>(&::eglGetDisplay)},
+        {"eglGetError", reinterpret_cast<void*>(&::eglGetError)},
+        {"eglGetPlatformDisplay", reinterpret_cast<void*>(&::eglGetPlatformDisplay)},
+        {"eglGetPlatformDisplayEXT", reinterpret_cast<void*>(&::eglGetPlatformDisplayEXT)},
+        {"eglGetProcAddress", reinterpret_cast<void*>(&::eglGetProcAddress)},
+        {"eglInitialize", reinterpret_cast<void*>(&::eglInitialize)},
+        {"eglMakeCurrent", reinterpret_cast<void*>(&::eglMakeCurrent)},
+        {"eglQueryAPI", reinterpret_cast<void*>(&::eglQueryAPI)},
+        {"eglQueryContext", reinterpret_cast<void*>(&::eglQueryContext)},
+        {"eglQueryString", reinterpret_cast<void*>(&::eglQueryString)},
+        {"eglQuerySurface", reinterpret_cast<void*>(&::eglQuerySurface)},
+        {"eglReleaseTexImage", reinterpret_cast<void*>(&::eglReleaseTexImage)},
+        {"eglReleaseThread", reinterpret_cast<void*>(&::eglReleaseThread)},
+        {"eglSurfaceAttrib", reinterpret_cast<void*>(&::eglSurfaceAttrib)},
+        {"eglSwapBuffers", reinterpret_cast<void*>(&::eglSwapBuffers)},
+        {"eglSwapBuffersWithDamageEXT", reinterpret_cast<void*>(&::eglSwapBuffersWithDamageEXT)},
+        {"eglSwapBuffersWithDamageKHR", reinterpret_cast<void*>(&::eglSwapBuffersWithDamageKHR)},
+        {"eglSwapInterval", reinterpret_cast<void*>(&::eglSwapInterval)},
+        {"eglTerminate", reinterpret_cast<void*>(&::eglTerminate)},
+        {"eglWaitClient", reinterpret_cast<void*>(&::eglWaitClient)},
+        {"eglWaitGL", reinterpret_cast<void*>(&::eglWaitGL)},
+        {"eglWaitNative", reinterpret_cast<void*>(&::eglWaitNative)},
+    };
+    }  // namespace
+
+EGL_API EGLAPI __eglMustCastToProperFunctionPointerType EGLAPIENTRY eglGetProcAddress(const char* procname) {
         mg_egl_note_call(__func__);
-        return reinterpret_cast<__eglMustCastToProperFunctionPointerType>(glXGetProcAddress(procname));
+        if (procname) {
+            for (const auto& entry : kEglExports) {
+                if (strcmp(procname, entry.name) == 0) {
+                    LOG_W_FORCE("eglGetProcAddress(%s) -> this library\'s own entry point", procname);
+                    return reinterpret_cast<__eglMustCastToProperFunctionPointerType>(entry.address);
+                }
+            }
+        }
+        void* host = glXGetProcAddress(procname);
+        LOG_W_FORCE("eglGetProcAddress(%s) -> %s%s", procname ? procname : "(null)",
+                    host ? "HOST driver" : "null",
+                    host ? " — calls through this pointer bypass this library" : "");
+        return reinterpret_cast<__eglMustCastToProperFunctionPointerType>(host);
     }
 }
