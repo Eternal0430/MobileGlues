@@ -51,6 +51,29 @@ void init_settings() {
     HideMGEnvLevel hideMGEnvLevel =
         success ? static_cast<HideMGEnvLevel>(config_get_int("hideMGEnvLevel")) : HideMGEnvLevel::Disabled;
 
+    // bufferCoherentAsFlush: when 1, glBufferStorage() forces
+    // COHERENT|PERSISTENT onto persistent/dynamic buffers and
+    // glFlushMappedBufferRange() is dropped (treated as a no-op).
+    //
+    // That was a workaround for hosts that only implement coherent persistent
+    // maps. It is wrong on a host that supports explicit flush, because the
+    // application's flush is then the only ordering signal and we discard it:
+    // the CPU may still be mid-write when the GPU reads, so a partially updated
+    // buffer is rendered. Minecraft writes its per-frame camera/uniform data
+    // through such a buffer, so the symptom is the view snapping back to an
+    // earlier position — "回退画面" — while the camera is moving, and nothing
+    // at all on a static screen like the main menu.
+    //
+    // The startup probe is what decides whether the workaround is needed. On
+    // the device that reported this:
+    //     Persistent map probe [UNIFORM_BUFFER]: storage=ok E2=ok C2=ok W=ok
+    // E2 (persistent without COHERENT, i.e. explicit flush) is supported, so
+    // the workaround is unnecessary there and actively harmful.
+    //
+    // Default 0: honour the application's flush. config_get_int() returns -1
+    // for an absent key, which is not > 0, so an absent key keeps the default.
+    int bufferCoherentAsFlushCfg = success ? config_get_int("bufferCoherentAsFlush") : -1;
+
     if (customGLVersionInt < 0) {
         customGLVersionInt = 0;
     }
@@ -177,7 +200,10 @@ void init_settings() {
 
     global_settings.angle = finalAngleMode;
     LOG_D("Final ANGLE setting: %d", static_cast<int>(global_settings.angle))
-    global_settings.buffer_coherent_as_flush = (global_settings.angle == AngleMode::Disabled);
+    // Was unconditionally true (angle is always Disabled here). Now defaults to
+    // false and is only enabled when explicitly requested in config.json, since
+    // the host supports explicit-flush persistent maps (see the note above).
+    global_settings.buffer_coherent_as_flush = (bufferCoherentAsFlushCfg > 0);
 
     if (global_settings.angle == AngleMode::Enabled) {
         // setenv("LIBGL_GLES", "libGLESv2_angle.so", 1);
