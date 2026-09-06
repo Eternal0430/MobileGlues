@@ -916,3 +916,52 @@ void mg_egl_note_guarded_call(const char* entry_point) {
 // thread. Releasing it would reintroduce the per-call churn that corrupts
 // driver state, and the window in which another thread could take it.
 void UnbindFallbackEGLContext() {}
+
+// ---------------------------------------------------------------------------
+// Self-promotion into the global symbol scope
+//
+// Root cause of every bypass seen so far. This library is built with
+// -fvisibility=hidden (CMakeLists.txt:32) and loaded with dlopen(...,
+// RTLD_LOCAL) — the default — so NONE of its symbols are in the global symbol
+// scope. Anything that resolves with dlsym(RTLD_DEFAULT, name) therefore gets
+// the host driver's function instead of ours and calls straight through to it,
+// leaving no trace in this library:
+//
+//   glx/lookup.cpp:56   proc = dlsym(RTLD_DEFAULT, name)
+//                       -> eglGetProcAddress(glGetError) returned HOST driver
+//                       -> eglGetProcAddress(glGetString) returned HOST driver
+//                       (measured, five separate entry points)
+//
+// That is also why SDL's swap never reaches this library even though every
+// other EGL call does (eglGetDisplay / eglInitialize / eglChooseConfig /
+// eglCreateContext / eglSwapInterval all ran here). Those arrive because SDL
+// holds a handle to this library; the swap is resolved by name lookup, which
+// lands on the host.
+//
+// Re-opening this library with RTLD_NOLOAD | RTLD_GLOBAL adds it to the global
+// scope without loading it a second time, so subsequent RTLD_DEFAULT lookups
+// can resolve to these entry points.
+// ---------------------------------------------------------------------------
+namespace {
+
+__attribute__((constructor)) void MobileGluesPromoteSelfToGlobalScope() {
+    Dl_info info;
+    if (dladdr(reinterpret_cast<void*>(&MobileGluesPromoteSelfToGlobalScope), &info) == 0 || !info.dli_fname) {
+        LOG_W_FORCE("self-promotion: could not determine this library's own path");
+        return;
+    }
+    void* self = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_GLOBAL);
+    if (!self) {
+        LOG_W_FORCE("self-promotion: dlopen(%s, RTLD_NOLOAD|RTLD_GLOBAL) failed", info.dli_fname);
+        return;
+    }
+
+    void* ours = dlsym(self, "eglSwapBuffers");
+    void* via_default = dlsym(RTLD_DEFAULT, "eglSwapBuffers");
+    LOG_W_FORCE("self-promotion: this library is in the global symbol scope now. eglSwapBuffers: ours=%p "
+                "dlsym(RTLD_DEFAULT)=%p -> %s",
+                ours, via_default,
+                (ours != nullptr && ours == via_default) ? "RESOLVES TO THIS LIBRARY" : "still resolves elsewhere");
+}
+
+}  // namespace
