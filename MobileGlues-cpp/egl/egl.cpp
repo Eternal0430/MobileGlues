@@ -232,6 +232,7 @@ extern "C"
         return egl_eglGetError();
     }
     EGL_API EGLDisplay eglGetDisplay(EGLNativeDisplayType display_id) {
+        LOG_W_FORCE("EGL-TRACE: eglGetDisplay called");
         mg_egl_note_call(__func__);
         LOG_D("eglGetDisplay, display_id: %p", display_id);
         LOAD_EGL(eglGetDisplay)
@@ -239,6 +240,7 @@ extern "C"
     }
 
     EGL_API EGLBoolean eglInitialize(EGLDisplay dpy, EGLint* major, EGLint* minor) {
+        LOG_W_FORCE("EGL-TRACE: eglInitialize called (dpy=%p)", (void*)dpy);
         mg_egl_note_call(__func__);
         LOG_D("eglInitialize, dpy: %p, major: %p, minor: %p", dpy, major, minor);
         LOAD_EGL(eglInitialize)
@@ -273,6 +275,7 @@ extern "C"
 
     EGL_API EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint* attrib_list, EGLConfig* configs,
                                        EGLint config_size, EGLint* num_config) {
+        LOG_W_FORCE("EGL-TRACE: eglChooseConfig called (dpy=%p)", (void*)dpy);
         mg_egl_note_call(__func__);
         LOG_D("eglChooseConfig, dpy: %p, attrib_list: %p, configs: %p, config_size: "
               "%d, num_config: %p",
@@ -358,6 +361,7 @@ extern "C"
     }
 
     EGL_API EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface surface, EGLint attribute, EGLint* value) {
+        LOG_W_FORCE("EGL-TRACE: eglQuerySurface called (dpy=%p)", (void*)dpy);
         mg_egl_note_call(__func__);
         LOG_D("eglQuerySurface, dpy: %p, surface: %p, attribute: %d, value: %p", dpy, surface, attribute, value);
         LOAD_EGL(eglQuerySurface)
@@ -424,6 +428,7 @@ extern "C"
     }
 
     EGL_API EGLBoolean eglSwapInterval(EGLDisplay dpy, EGLint interval) {
+        LOG_W_FORCE("EGL-TRACE: eglSwapInterval called (dpy=%p)", (void*)dpy);
         mg_egl_note_call(__func__);
         LOG_D("eglSwapInterval, dpy: %p, interval: %d", dpy, interval);
         LOAD_EGL(eglSwapInterval)
@@ -432,6 +437,7 @@ extern "C"
 
     EGL_API EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_context,
                                         const EGLint* attrib_list) {
+        LOG_W_FORCE("EGL-TRACE: eglCreateContext called (dpy=%p)", (void*)dpy);
         mg_egl_note_call(__func__);
         LOG_D("eglCreateContext, dpy: %p, config: %p, share_context: %p, "
               "attrib_list: %p",
@@ -508,6 +514,17 @@ extern "C"
 
     EGL_API EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         mg_egl_note_call(__func__);
+        // Forced, rate-limited. The whole point is to know whether the swap ever
+        // reaches this library at all, and debug logging is off in release
+        // builds — the one run where it is needed is the run where nothing else
+        // is printed.
+        {
+            static std::atomic<unsigned long> count{0};
+            const unsigned long n = count.fetch_add(1, std::memory_order_relaxed);
+            if (n < 5 || (n % 600) == 0) {
+                LOG_W_FORCE("EGL-TRACE: eglSwapBuffers #%lu dpy=%p surface=%p", n, dpy, surface);
+            }
+        }
         LOG_D("eglSwapBuffers, dpy: %p, surface: %p", dpy, surface);
         LOAD_EGL(eglSwapBuffers)
         EGLBoolean result;
@@ -541,6 +558,7 @@ extern "C"
     // swaps visible and feeds the same tracking as eglSwapBuffers.
     EGL_API EGLBoolean eglSwapBuffersWithDamageEXT(EGLDisplay dpy, EGLSurface surface, const EGLint* rects,
                                                    EGLint n_rects) {
+        LOG_W_FORCE("EGL-TRACE: eglSwapBuffersWithDamageEXT called surface=%p n_rects=%d", surface, n_rects);
         mg_egl_note_call(__func__);
         LOG_D("eglSwapBuffersWithDamageEXT, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
         LOAD_EGL(eglSwapBuffersWithDamageEXT)
@@ -560,6 +578,7 @@ extern "C"
 
     EGL_API EGLBoolean eglSwapBuffersWithDamageKHR(EGLDisplay dpy, EGLSurface surface, const EGLint* rects,
                                                    EGLint n_rects) {
+        LOG_W_FORCE("EGL-TRACE: eglSwapBuffersWithDamageKHR called surface=%p n_rects=%d", surface, n_rects);
         mg_egl_note_call(__func__);
         LOG_D("eglSwapBuffersWithDamageKHR, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
         LOAD_EGL(eglSwapBuffersWithDamageKHR)
