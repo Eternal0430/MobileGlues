@@ -188,6 +188,7 @@ struct global_settings_t {
     bool ext_timer_query;
     bool ext_direct_state_access;
     bool buffer_coherent_as_flush;
+    bool present_fallback;
     size_t max_glsl_cache_size;
     // Resolved backend per multi-draw entry point. Always a concrete backend
     // after init_settings_post(); never md_backend_t::Auto.

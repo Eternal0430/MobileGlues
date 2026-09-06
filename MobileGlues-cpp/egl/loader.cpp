@@ -9,6 +9,7 @@
 #include "../gl/envvars.h"
 #include "../gl/log.h"
 #include "../gl/mg.h"
+#include "../config/settings.h"
 #include "../gles/loader.h"
 #include "../includes.h"
 #include <EGL/egl.h>
@@ -931,6 +932,7 @@ constexpr auto kMaxPresentLatency = std::chrono::milliseconds(100);
 
 void MaybePresentFrame() {
     if (!g_present_fallback_active.load(std::memory_order_acquire)) return;
+    if (!global_settings.present_fallback) return;
 
     const AppRenderTarget& t = mg_egl_app_target();
     if (t.display == EGL_NO_DISPLAY) return;
