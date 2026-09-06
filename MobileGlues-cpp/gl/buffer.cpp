@@ -1166,6 +1166,31 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
     // See glMapBufferRange for why this thread may not have one.
     ScopedHostContext hostCtx(__func__);
     if (GLES.glBufferStorageEXT) {
+        // A flags word that says "mappable" or "updatable" without naming a
+        // direction is rejected outright by this host
+        // (GL_ARRAY_BUFFER, 256 KB, flags=0x100 = DYNAMIC_STORAGE alone,
+        // glError=0x502 GL_INVALID_OPERATION). The allocation then does not
+        // happen, the buffer is left with no storage, and a later
+        // glMapBufferRange returns NULL — measured on this device.
+        //
+        // That is what made terrain "roll back": Minecraft/Sodium allocates its
+        // chunk vertex buffer this way, so while moving through the world every
+        // upload silently failed and the renderer kept drawing the previous
+        // frame's geometry. The main menu allocates no chunk buffers, which is
+        // why it looked fine.
+        //
+        // buffer_coherent_as_flush=1 used to paper over this by OR-ing in
+        // WRITE|COHERENT|PERSISTENT. Turning it off exposed the rejection. Add
+        // only a direction bit here: COHERENT is deliberately NOT added, so the
+        // application's own glFlushMappedBufferRange remains the ordering
+        // signal, which is the whole point of that setting being 0.
+        const GLbitfield map_direction = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT;
+        const GLbitfield needs_direction =
+            GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT | GL_MAP_FLUSH_EXPLICIT_BIT | GL_DYNAMIC_STORAGE_BIT;
+        if ((flags & needs_direction) != 0 && (flags & map_direction) == 0) {
+            flags |= GL_MAP_WRITE_BIT;
+        }
+
         if (global_settings.buffer_coherent_as_flush &&
             ((flags & GL_MAP_PERSISTENT_BIT) != 0 || (flags & GL_DYNAMIC_STORAGE_BIT) != 0))
             flags |= (GL_MAP_WRITE_BIT | GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT);
@@ -1174,15 +1199,26 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
         // CHECK_GL_ERROR compiles to nothing in release builds, so a rejected
         // allocation would leave the buffer with no storage and leave no trace
         // at all — the caller only finds out later, when glMapBufferRange
-        // returns NULL. Report the first rejection here.
+        // returns NULL. Report the first rejection, and keep counting: the
+        // failure repeats on every chunk upload, and a single "warn once" line
+        // made a per-frame problem look like a one-off.
         if (GLES.glGetError) {
             static bool storage_warned_once = false;
+            static std::atomic<unsigned long> storage_rejections{0};
             const GLenum err = GLES.glGetError();
-            if (err != GL_NO_ERROR && !storage_warned_once) {
-                storage_warned_once = true;
-                LOG_W_FORCE("glBufferStorage was rejected: target=%s(0x%x) size=%lld flags=0x%x glError=0x%x — the "
-                            "buffer has no storage, so a later glMapBufferRange will return NULL",
-                            glEnumToString(target), target, (long long)size, flags, err);
+            if (err != GL_NO_ERROR) {
+                const unsigned long n = storage_rejections.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (!storage_warned_once) {
+                    storage_warned_once = true;
+                    LOG_W_FORCE("glBufferStorage was rejected: target=%s(0x%x) size=%lld flags=0x%x glError=0x%x — the "
+                                "buffer has no storage, so a later glMapBufferRange will return NULL",
+                                glEnumToString(target), target, (long long)size, flags, err);
+                }
+                if (n == 100 || n == 1000 || n == 10000) {
+                    LOG_W_FORCE("glBufferStorage has been rejected %lu times (last: target=%s flags=0x%x err=0x%x) — "
+                                "uploads to these buffers are being lost every frame",
+                                n, glEnumToString(target), flags, err);
+                }
             }
         }
 

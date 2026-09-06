@@ -851,6 +851,14 @@ thread_local std::chrono::steady_clock::time_point t_prev_gl_call{};
 thread_local std::chrono::steady_clock::time_point t_last_gl_call{};
 thread_local bool t_gl_timestamps_primed = false;
 
+// Draw calls issued since the last fallback presentation. A swap with none of
+// them behind it presents a back buffer the application has not touched since
+// the previous swap, and on a triple-buffered display that drags an older frame
+// back to the front — the picture appears to roll back. Counting them is what
+// keeps the fallback's rate tied to the application's actual frame rate instead
+// of to the wall clock.
+thread_local unsigned long t_draws_since_present = 0;
+
 // A gap this wide between two consecutive GL calls means the renderer stopped
 // issuing work — the previous frame is complete and a new one has not started.
 // Inside a frame the calls are microseconds apart; between frames the thread
@@ -896,6 +904,13 @@ void MaybePresentFrame() {
         !primed || (t_last_present.time_since_epoch().count() != 0 && now - t_last_present >= kMaxPresentLatency);
     if (!quiet && !overdue) return;
 
+    // Nothing has been drawn since the last presentation, so there is no new
+    // frame to show. Swapping anyway is what made the picture roll back: the
+    // fallback ran at a fixed ~60 Hz while the game, busy loading and uploading
+    // terrain, produced frames more slowly, so some swaps published a back
+    // buffer the game had not rewritten — an older frame.
+    if (t_draws_since_present == 0) return;
+
     LOAD_EGL(eglSwapBuffers);
     LOAD_EGL(eglWaitGL);
     LOAD_EGL(eglGetError);
@@ -905,6 +920,8 @@ void MaybePresentFrame() {
     if (egl_eglWaitGL) egl_eglWaitGL();
 
     t_last_present = now;
+    const unsigned long draws = t_draws_since_present;
+    t_draws_since_present = 0;
     const EGLBoolean ok = egl_eglSwapBuffers(t.display, target);
     if (ok != EGL_TRUE) {
         LOG_W_FORCE("present fallback: eglSwapBuffers(%p) failed (0x%x) — the picture will not update", target,
@@ -919,8 +936,9 @@ void MaybePresentFrame() {
                     target);
     }
     if (n == 1 || n == 60 || n == 600) {
-        LOG_W_FORCE("present fallback: %lu swaps so far (this one on %s)%s", n,
+        LOG_W_FORCE("present fallback: %lu swaps so far (this one on %s, %lu draw calls)%s", n,
                     quiet ? "a quiet period — the frame looked complete" : "the latency ceiling — frame may be partial",
+                    draws,
                     g_present_fallback_active.load(std::memory_order_acquire)
                         ? " — still active, so the application is not presenting"
                         : " — already stopped, so the application took over presenting");
@@ -951,6 +969,14 @@ void mg_egl_note_guarded_call(const char* entry_point) {
     g_guarded_calls.fetch_add(1, std::memory_order_relaxed);
     histogram_add(entry_point, pthread_self());
     VerifyContextStillCurrent(t_calls);
+
+    // Draw calls are what makes a frame worth showing. Multidraw is included
+    // because that is the path this game actually takes.
+    if (entry_point) {
+        if (strncmp(entry_point, "glDraw", 6) == 0 || strncmp(entry_point, "glMultiDraw", 11) == 0) {
+            ++t_draws_since_present;
+        }
+    }
 
     // Slide the call timestamps before the fallback reads them: it runs inside
     // this call, so the gap it must judge is the one leading into it.
