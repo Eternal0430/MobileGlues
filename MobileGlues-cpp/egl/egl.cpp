@@ -37,6 +37,83 @@ std::mutex g_target_mutex;
 AppRenderTarget g_target;
 std::atomic<unsigned> g_target_generation{0};
 
+// ---------------------------------------------------------------------------
+// Window-surface redirection
+//
+// Why this exists, from the log:
+//
+//   306  eglCreateWindowSurface -> 0x77530f5980      (first window)
+//   313  eglMakeCurrent         -> 0x77530f5980
+//   324  SDL_Hook: reusing primary window 0x78638a0600, refs=2
+//   326  eglMakeCurrent: released
+//   327  eglDestroySurface      -> 0x77530f5980
+//   338  eglCreateWindowSurface -> 0x77c7356e00      (second window)
+//
+// SDL caches the EGLSurface inside its own window (0x78638a0600, reused). Its
+// cached copy is 0x77530f5980, which by line 338 is already destroyed. Anything
+// SDL then does with that handle is an operation on a dead surface, so its swap
+// cannot reach the screen — and indeed this library's eglSwapBuffers and both
+// damage variants were called zero times in every session logged.
+//
+// The fix is to stop letting that handle die. Window surfaces are kept alive in
+// a short history, and any operation that arrives on an older one is redirected
+// to the newest. SDL keeps using its cached handle, we quietly serve the surface
+// that is actually on screen, and the swap chain completes — after which the
+// present fallback switches itself off and the rolling-back goes away, because
+// the application is presenting at its own frame boundaries again.
+//
+// Only surfaces created by eglCreateWindowSurface / eglCreatePlatformWindowSurface
+// are tracked. Pbuffers and pixmaps are destroyed immediately as before.
+// ---------------------------------------------------------------------------
+std::mutex g_window_surfaces_mutex;
+// Oldest first, newest last. The last entry is the live one.
+std::vector<EGLSurface> g_window_surfaces;
+// Keep a few generations: SDL has been seen to hold more than one stale handle.
+constexpr size_t kMaxRetainedWindowSurfaces = 4;
+
+void ReallyDestroyWindowSurface(EGLDisplay dpy, EGLSurface surface) {
+    LOAD_EGL(eglDestroySurface)
+    if (!egl_eglDestroySurface) return;
+    egl_eglDestroySurface(dpy, surface);
+}
+
+void RecordWindowSurface(EGLDisplay dpy, EGLSurface surface) {
+    if (surface == EGL_NO_SURFACE) return;
+    std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
+    if (std::find(g_window_surfaces.begin(), g_window_surfaces.end(), surface) != g_window_surfaces.end()) return;
+    g_window_surfaces.push_back(surface);
+    LOG_W_FORCE("window surface %p recorded (%zu generations retained)", surface, g_window_surfaces.size());
+    // Really destroy only what has aged out; the rest stay alive so stale
+    // handles SDL still holds keep working.
+    while (g_window_surfaces.size() > kMaxRetainedWindowSurfaces) {
+        EGLSurface oldest = g_window_surfaces.front();
+        g_window_surfaces.erase(g_window_surfaces.begin());
+        LOG_W_FORCE("window surface %p aged out, destroying it for real", oldest);
+        ReallyDestroyWindowSurface(dpy, oldest);
+    }
+}
+
+bool IsTrackedWindowSurface(EGLSurface surface) {
+    std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
+    return std::find(g_window_surfaces.begin(), g_window_surfaces.end(), surface) != g_window_surfaces.end();
+}
+
+// Maps a stale window-surface handle onto the live one. Anything else is
+// returned unchanged.
+EGLSurface ResolveWindowSurface(EGLDisplay dpy, EGLSurface surface) {
+    (void)dpy;
+    std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
+    if (g_window_surfaces.empty()) return surface;
+    const EGLSurface live = g_window_surfaces.back();
+    if (surface == live) return surface;
+    if (std::find(g_window_surfaces.begin(), g_window_surfaces.end(), surface) == g_window_surfaces.end()) {
+        return surface;  // not a tracked window surface; leave it alone
+    }
+    LOG_W_FORCE("window surface %p is stale (SDL reused its window) — redirecting this operation to the live surface %p",
+                surface, live);
+    return live;
+}
+
 } // namespace
 
 const AppRenderTarget& mg_egl_app_target() {
@@ -305,6 +382,7 @@ extern "C"
         LOAD_EGL(eglCreateWindowSurface)
         EGLSurface surf = egl_eglCreateWindowSurface(dpy, config, win, attrib_list);
         mg_egl_note_window_surface(dpy, config, surf);
+        RecordWindowSurface(dpy, surf);
         mg_egl_activate_window_surface(dpy, surf);
         return surf;
     }
@@ -339,6 +417,7 @@ extern "C"
         EGLSurface surf =
             egl_eglCreatePlatformWindowSurface(dpy, config, native_window, narrow.empty() ? nullptr : narrow.data());
         mg_egl_note_window_surface(dpy, config, surf);
+        RecordWindowSurface(dpy, surf);
         mg_egl_activate_window_surface(dpy, surf);
         return surf;
     }
@@ -363,6 +442,20 @@ extern "C"
     EGL_API EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface surface) {
         mg_egl_note_call(__func__);
         LOG_D("eglDestroySurface, dpy: %p, surface: %p", dpy, surface);
+
+        // A window surface is kept alive: SDL caches the handle inside its own
+        // window and keeps using it after asking for it to be destroyed. Really
+        // destroying it here is what left SDL presenting to a dead surface in
+        // the first place. It is destroyed later, when it ages out of the
+        // history — see RecordWindowSurface.
+        if (IsTrackedWindowSurface(surface)) {
+            LOG_W_FORCE("eglDestroySurface(%p): window surface kept alive — SDL may still hold this handle and use it "
+                        "to present; it will be destroyed once it ages out",
+                        surface);
+            mg_egl_note_destroy_surface(dpy, surface);
+            return EGL_TRUE;
+        }
+
         LOAD_EGL(eglDestroySurface)
         EGLBoolean ok = egl_eglDestroySurface(dpy, surface);
         if (ok == EGL_TRUE) mg_egl_note_destroy_surface(dpy, surface);
@@ -465,6 +558,10 @@ extern "C"
     EGL_API EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
         mg_egl_note_call(__func__);
         LOG_D("eglMakeCurrent, dpy: %p, draw: %p, read: %p, ctx: %p", dpy, draw, read, ctx);
+        // Same stale-handle problem as the swap: SDL binds the surface it cached
+        // when it created the window, which may have been destroyed since.
+        draw = ResolveWindowSurface(dpy, draw);
+        read = ResolveWindowSurface(dpy, read);
         LOAD_EGL(eglMakeCurrent)
         EGLBoolean ok = egl_eglMakeCurrent(dpy, draw, read, ctx);
         if (ok != EGL_TRUE) {
@@ -535,6 +632,10 @@ extern "C"
             }
         }
         LOG_D("eglSwapBuffers, dpy: %p, surface: %p", dpy, surface);
+        // SDL presents through the handle cached in its own window, which is a
+        // surface it has already asked to destroy. Redirect it to the live one
+        // so this present actually lands.
+        surface = ResolveWindowSurface(dpy, surface);
         LOAD_EGL(eglSwapBuffers)
         EGLBoolean result;
         if (global_settings.fsr1_setting != FSR1_Quality_Preset::Disabled) {
@@ -574,6 +675,7 @@ extern "C"
         LOG_W_FORCE("EGL-TRACE: eglSwapBuffersWithDamageEXT called surface=%p n_rects=%d", surface, n_rects);
         mg_egl_note_call(__func__);
         LOG_D("eglSwapBuffersWithDamageEXT, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
+        surface = ResolveWindowSurface(dpy, surface);
         LOAD_EGL(eglSwapBuffersWithDamageEXT)
         if (!egl_eglSwapBuffersWithDamageEXT) {
             // Not available: fall back rather than drop the frame entirely.
@@ -604,6 +706,7 @@ extern "C"
         LOG_W_FORCE("EGL-TRACE: eglSwapBuffersWithDamageKHR called surface=%p n_rects=%d", surface, n_rects);
         mg_egl_note_call(__func__);
         LOG_D("eglSwapBuffersWithDamageKHR, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
+        surface = ResolveWindowSurface(dpy, surface);
         LOAD_EGL(eglSwapBuffersWithDamageKHR)
         if (!egl_eglSwapBuffersWithDamageKHR) {
             LOG_W_FORCE("eglSwapBuffersWithDamageKHR: unavailable, using eglSwapBuffers for surface %p", surface);
