@@ -714,125 +714,6 @@ void WatchdogLoop() {
 
 }  // namespace
 
-namespace {
-
-// ---------------------------------------------------------------------------
-// Forced-swap fallback
-//
-// Added after a real log showed the whole chain broken one link short:
-//
-//     eglCreateWindowSurface -> 0x77ac21a200
-//     eglMakeCurrent         -> bound 0x77ac21a200        (first window, fine)
-//     SDL_Hook: reusing primary window, refs=2
-//     eglMakeCurrent         -> released
-//     eglDestroySurface      -> 0x77ac21a200 destroyed
-//     eglCreateWindowSurface -> 0x77ac53a980
-//     eglMakeCurrent         -> (never)
-//     eglSwapBuffers         -> (never, not once)
-//
-// SDL creates the second surface and then stops. It never makes it current, so
-// its own window bookkeeping has nothing to present and it skips the swap
-// entirely — silently, with no error. Meanwhile the game keeps drawing at a few
-// thousand GL calls per second into a surface that is never shown.
-//
-// This presents that surface from the drawing thread instead, at roughly
-// display refresh rate, until the application presents on its own. It is a
-// fallback for a broken swap chain, not a replacement for a working one: the
-// moment a real eglSwapBuffers arrives, mg_egl_note_app_swap() turns it off for
-// good.
-// ---------------------------------------------------------------------------
-std::atomic<bool> g_forced_swap_active{true};
-
-// Only on the drawing thread, which is where the context and surface are
-// current. Swapping from another thread would either race with drawing or
-// flush the wrong context.
-struct FrameClock {
-    std::chrono::steady_clock::time_point last_call{};
-    std::chrono::steady_clock::time_point last_swap{};
-    unsigned long calls_since_swap = 0;
-    bool primed = false;
-    // Set once a gap between frames has actually been observed. While it is
-    // false there is no frame boundary to present on, so the timed fallback is
-    // used instead; once a boundary has been seen, the timed path is switched
-    // off permanently so it cannot later present in the middle of a frame.
-    bool gap_seen = false;
-};
-
-thread_local FrameClock t_frame;
-
-// A gap this long between consecutive GL calls means the previous frame
-// finished and a new one has begun. Well under one frame at 60 Hz, and far
-// above the sub-microsecond spacing between calls inside a frame.
-constexpr auto kFrameGap = std::chrono::microseconds(1200);
-
-// Only used until a frame boundary is first observed. If none ever is, the
-// render loop never pauses and something must present regardless.
-constexpr auto kMaxLatency = std::chrono::milliseconds(32);
-
-void MaybeForceSwap() {
-    if (!g_forced_swap_active.load(std::memory_order_acquire)) return;
-
-    const auto now = std::chrono::steady_clock::now();
-
-    FrameClock& fc = t_frame;
-    if (!fc.primed) {
-        fc.primed = true;
-        fc.last_call = now;
-        fc.last_swap = now;
-        return;
-    }
-
-    const bool new_frame = (now - fc.last_call) >= kFrameGap;
-    const bool overdue = !fc.gap_seen && (now - fc.last_swap) >= kMaxLatency;
-    fc.last_call = now;
-    ++fc.calls_since_swap;
-
-    // Nothing has been drawn since the last presentation — presenting again
-    // would just show the same frame twice.
-    if (fc.calls_since_swap == 0) return;
-    if (!new_frame && !overdue) return;
-
-    const AppRenderTarget& t = mg_egl_app_target();
-    if (t.display == EGL_NO_DISPLAY) return;
-
-    // Prefer the surface this thread is actually drawing into; fall back to the
-    // most recent window surface the application created.
-    EGLSurface target = (t_fb.bound_surface != EGL_NO_SURFACE) ? t_fb.bound_surface : t.draw_surface;
-    if (target == EGL_NO_SURFACE) return;
-
-    LOAD_EGL(eglSwapBuffers);
-    if (!egl_eglSwapBuffers) return;
-
-    const EGLBoolean ok = egl_eglSwapBuffers(t.display, target);
-    const unsigned long calls = fc.calls_since_swap;
-    fc.last_swap = now;
-    fc.calls_since_swap = 0;
-    if (ok != EGL_TRUE) return;
-
-    if (new_frame) fc.gap_seen = true;
-
-    static std::atomic<int> logged{0};
-    const int n = logged.fetch_add(1, std::memory_order_relaxed);
-    if (n == 0) {
-        LOG_W_FORCE("forced swap: the application never calls eglSwapBuffers, so this library is presenting surface "
-                    "%p itself. This is a fallback for a broken swap chain, not a fix for it.",
-                    target);
-    }
-    if (n < 5 || n == 20 || n == 100) {
-        LOG_W_FORCE("forced swap #%d: presented on %s after %lu GL calls in that frame%s", n,
-                    new_frame ? "a frame boundary" : "the timed fallback", calls,
-                    new_frame ? "" : " — no frame boundary has been observed yet");
-    }
-
-    mg_egl_note_swap(t.display, target, ok);
-}
-
-}  // namespace
-
-void mg_egl_note_app_swap() {
-    g_forced_swap_active.store(false, std::memory_order_release);
-}
-
 // Bind the application's context to a freshly created window surface, right
 // away, on whichever thread created it.
 //
@@ -880,7 +761,6 @@ void mg_egl_note_guarded_call(const char* entry_point) {
     g_guarded_calls.fetch_add(1, std::memory_order_relaxed);
     histogram_add(entry_point, pthread_self());
     VerifyContextStillCurrent(t_calls);
-    MaybeForceSwap();
     if (!g_watchdog_started.exchange(true)) {
         // Detached and deliberately never joined: it outlives the GL session and
         // costs one wake-up every 20 seconds.
