@@ -10,6 +10,7 @@
 #include "../gl/log.h"
 #include "../gl/mg.h"
 #include "../config/settings.h"
+#include "../config/config.h"
 #include "../gles/loader.h"
 #include "../includes.h"
 #include <EGL/egl.h>
@@ -747,6 +748,13 @@ void WatchdogLoop() {
 //    when SDL later binds the application's context it simply replaces it.
 void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface) {
     if (surface == EGL_NO_SURFACE) return;
+    if (!global_settings.activate_on_create) {
+        // Off: the surface is only recorded, exactly as this library behaved
+        // before the change. The application is then expected to call
+        // eglMakeCurrent for it; when SDL reuses its primary window it does not,
+        // and the surface that ends up on screen has no context bound to it.
+        return;
+    }
 
     const AppRenderTarget& t = mg_egl_app_target();
 
@@ -1116,6 +1124,16 @@ void UnbindFallbackEGLContext() {}
 namespace {
 
 __attribute__((constructor)) void MobileGluesPromoteSelfToGlobalScope() {
+    // Runs at dlopen time, before init_settings(), so the configuration is read
+    // here rather than from global_settings. config_refresh() is idempotent;
+    // init_settings() parses the same file again shortly after.
+    config_refresh();
+    if (config_has_key("selfPromotion") && config_get_int(const_cast<char*>("selfPromotion")) == 0) {
+        LOG_W_FORCE("self-promotion: disabled by config (selfPromotion=0) — dlsym(RTLD_DEFAULT, ...) will keep "
+                    "resolving to the host driver");
+        return;
+    }
+
     Dl_info info;
     if (dladdr(reinterpret_cast<void*>(&MobileGluesPromoteSelfToGlobalScope), &info) == 0 || !info.dli_fname) {
         LOG_W_FORCE("self-promotion: could not determine this library's own path");

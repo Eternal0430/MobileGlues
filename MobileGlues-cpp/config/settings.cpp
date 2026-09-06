@@ -86,6 +86,14 @@ void init_settings() {
     // plain pass-through without rebuilding.
     int presentFallbackCfg = success ? config_get_int("presentFallback") : -1;
 
+    // All four default to ON. A missing key (-1) keeps them enabled; only an
+    // explicit 0 turns one off. They are independent: any combination is
+    // meaningful, and switching one off is meant to be tested against the
+    // others staying on so the difference can be attributed to that one alone.
+    int selfPromotionCfg = success ? config_get_int("selfPromotion") : -1;
+    int activateOnCreateCfg = success ? config_get_int("activateOnCreate") : -1;
+    int procAddressOwnCfg = success ? config_get_int("procAddressOwn") : -1;
+
     if (customGLVersionInt < 0) {
         customGLVersionInt = 0;
     }
@@ -219,6 +227,9 @@ void init_settings() {
     // Default on: an absent key (-1) keeps it enabled. Only an explicit
     // "presentFallback": 0 turns it off.
     global_settings.present_fallback = (presentFallbackCfg != 0);
+    global_settings.self_promotion = (selfPromotionCfg != 0);
+    global_settings.activate_on_create = (activateOnCreateCfg != 0);
+    global_settings.proc_address_own = (procAddressOwnCfg != 0);
 
     if (global_settings.angle == AngleMode::Enabled) {
         // setenv("LIBGL_GLES", "libGLESv2_angle.so", 1);
@@ -267,6 +278,14 @@ void init_settings() {
           static_cast<int>(global_settings.angle_depth_clear_fix_mode))
     LOG_V("[MobileGlues] Setting: bufferCoherentAsFlush       = %i",
           static_cast<int>(global_settings.buffer_coherent_as_flush))
+    LOG_V("[MobileGlues] Setting: presentFallback             = %i",
+          static_cast<int>(global_settings.present_fallback))
+    LOG_V("[MobileGlues] Setting: selfPromotion               = %i",
+          static_cast<int>(global_settings.self_promotion))
+    LOG_V("[MobileGlues] Setting: activateOnCreate            = %i",
+          static_cast<int>(global_settings.activate_on_create))
+    LOG_V("[MobileGlues] Setting: procAddressOwn              = %i",
+          static_cast<int>(global_settings.proc_address_own))
     if (global_settings.custom_gl_version.isEmpty()) {
         LOG_V("[MobileGlues] Setting: customGLVersion             = (default)");
     } else {

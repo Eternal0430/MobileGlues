@@ -739,7 +739,15 @@ EGL_API EGLAPI __eglMustCastToProperFunctionPointerType EGLAPIENTRY eglGetProcAd
         if (procname) {
             for (const auto& entry : kEglExports) {
                 if (strcmp(procname, entry.name) == 0) {
-                    LOG_W_FORCE("eglGetProcAddress(%s) -> this library\'s own entry point", procname);
+                    if (!global_settings.proc_address_own) {
+                        // Off: answer from the host, as this library did before
+                        // the change. Every call through the returned pointer then
+                        // bypasses this library entirely.
+                        LOG_W_FORCE("eglGetProcAddress(%s) -> HOST driver (procAddressOwn=0)", procname);
+                        void* host = glXGetProcAddress(procname);
+                        return reinterpret_cast<__eglMustCastToProperFunctionPointerType>(host);
+                    }
+                    LOG_W_FORCE("eglGetProcAddress(%s) -> this library's own entry point", procname);
                     return reinterpret_cast<__eglMustCastToProperFunctionPointerType>(entry.address);
                 }
             }

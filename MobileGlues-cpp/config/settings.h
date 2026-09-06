@@ -189,6 +189,12 @@ struct global_settings_t {
     bool ext_direct_state_access;
     bool buffer_coherent_as_flush;
     bool present_fallback;
+    // Each of the four workarounds below can be switched off on its own, so a
+    // single change in behaviour can be attributed to one of them instead of to
+    // the pile. See the notes at each use site for what breaks when it is off.
+    bool self_promotion;      // dlopen(self, RTLD_NOLOAD|RTLD_GLOBAL)
+    bool activate_on_create;  // bind a context to a window surface at creation
+    bool proc_address_own;    // eglGetProcAddress answers from this library first
     size_t max_glsl_cache_size;
     // Resolved backend per multi-draw entry point. Always a concrete backend
     // after init_settings_post(); never md_backend_t::Auto.
