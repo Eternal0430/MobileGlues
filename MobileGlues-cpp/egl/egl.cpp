@@ -13,6 +13,7 @@
 #include "../gles/loader.h"
 #include "../glx/lookup.h"
 #include "loader.h"
+#include <algorithm>
 #include <vector>
 
 #include <atomic>
