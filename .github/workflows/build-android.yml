@@ -104,10 +104,12 @@ jobs:
           # through the contents API directly. That is the one channel that has
           # been reliably reachable. The file stays on a scratch branch; the API
           # creates or updates it whichever already exists.
-          python3 - "$GH_REPO" "$GH_TOKEN" "${{ github.sha }}" <<'PYEOF'
+          python3 <<'PYEOF'
 import base64, json, os, urllib.request
 
-repo, token, sha = os.sys.argv[1], os.sys.argv[2], os.sys.argv[3]
+repo = os.environ["GH_REPO"]
+token = os.environ["GH_TOKEN"]
+sha = os.environ.get("GITHUB_SHA", "")
 path = "ci-last-failure.md"
 ref = "ci-failure-logs"
 body = open("/tmp/report.md", "rb").read()
