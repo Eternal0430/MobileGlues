@@ -3,9 +3,6 @@ on: [push, workflow_dispatch]
 jobs:
   build-android:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      issues: write
     env:
       NDK_VERSION: 27.3.13750724
       ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/27.3.13750724
@@ -41,45 +38,10 @@ jobs:
             -DANDROID_STL=c++_static \
             -DSTATICLIB=OFF \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_FLAGS="-Wno-error=implicit-function-declaration" > /tmp/cmake-configure.log 2>&1
-          configure_rc=$?
-          if [ $configure_rc -ne 0 ]; then
-            echo "CMAKE CONFIGURE FAILED rc=$configure_rc"
-            tail -n 60 /tmp/cmake-configure.log
-            exit $configure_rc
-          fi
-          # Keep the full log in a file instead of the step output: a verbose
-          # build log gets truncated by the Actions UI, which hides the actual
-          # error, and the raw log endpoint is not reachable from where these
-          # failures get investigated.
-          cmake --build build --config Release --target mobileglues > /tmp/cmake-build.log 2>&1
-          build_rc=$?
-          if [ $build_rc -ne 0 ]; then
-            echo "BUILD FAILED rc=$build_rc"
-            # Also into the step summary: the step log gets truncated in the UI
-            # and the raw-log endpoint is not reachable from the environment
-            # where these failures are investigated, so the summary is the
-            # channel that reliably carries the message back.
-            {
-              echo '### Build errors'
-              echo '```'
-              grep -nE "error:|error [0-9]+|FAILED|fatal error|undefined reference" /tmp/cmake-build.log | head -n 40
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-            grep -nE "error:|error [0-9]+|FAILED|fatal error|undefined reference" /tmp/cmake-build.log | head -n 40
-            exit $build_rc
-          fi
-          tail -n 5 /tmp/cmake-build.log
+            -DCMAKE_C_FLAGS="-Wno-error=implicit-function-declaration"
+          cmake --build build --config Release --target mobileglues
 
-      - name: Upload build log
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-failure-log
-          path: /tmp/cmake-build.log
-          if-no-files-found: ignore
-
-      - name: Strip shared library      - name: Strip shared library
+      - name: Strip shared library
         run: |
           STRIP="${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
           LIB_PATH="MobileGlues-cpp/build/libmobileglues.so"
