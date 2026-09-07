@@ -4,7 +4,7 @@ jobs:
   build-android:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       issues: write
     env:
       NDK_VERSION: 27.3.13750724
