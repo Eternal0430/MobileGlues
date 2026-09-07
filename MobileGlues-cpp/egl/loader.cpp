@@ -814,16 +814,17 @@ void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface) {
     }
 }
 
-namespace {
-
+// Not inside an anonymous namespace: it is declared in loader.h and called from
+// egl.cpp, so it needs external linkage. It landed inside one when the present
+// fallback was deleted, which made the link fail with
+// "undefined symbol: mg_egl_note_call(char const*)" — a fault that -fsyntax-only
+// cannot catch, because each translation unit still compiles fine on its own.
 void mg_egl_note_call(const char* entry_point) {
     histogram_add(entry_point, pthread_self());
     if (!g_watchdog_started.exchange(true)) {
         std::thread(WatchdogLoop).detach();
     }
 }
-
-}  // namespace
 
 void mg_egl_note_guarded_call(const char* entry_point) {
     static thread_local unsigned long t_calls = 0;
