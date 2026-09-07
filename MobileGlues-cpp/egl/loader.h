@@ -361,10 +361,9 @@ void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface);
 // rather than eglGetProcAddress — the names it does look up are logged, and
 // eglSwapBuffers is not among them — and what dlsym hands back is not this
 // library's entry point, so those swaps bypass everything here.
-void mg_egl_note_app_swap();
 
 // Called from eglSwapBuffers, for diagnostics.
-void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok, bool from_fallback = false);
+void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok);
 
 const AppRenderTarget& mg_egl_app_target();
 

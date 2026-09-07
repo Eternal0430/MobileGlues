@@ -74,17 +74,6 @@ void init_settings() {
     // for an absent key, which is not > 0, so an absent key keeps the default.
     int bufferCoherentAsFlushCfg = success ? config_get_int("bufferCoherentAsFlush") : -1;
 
-    // presentFallback: when 1 (default), this library swaps the window surface
-    // itself whenever the application never presents. Turning it off restores
-    // pass-through behaviour — the picture then depends entirely on the
-    // application presenting on its own, and on this device that has never
-    // happened in any logged session (this library's eglSwapBuffers and both
-    // damage variants were called zero times), so the screen stays black while
-    // the game runs normally underneath.
-    //
-    // Provided as a switch so the current behaviour can be A/B'd against a
-    // plain pass-through without rebuilding.
-    int presentFallbackCfg = success ? config_get_int("presentFallback") : -1;
 
     // All four default to ON. A missing key (-1) keeps them enabled; only an
     // explicit 0 turns one off. They are independent: any combination is
@@ -224,9 +213,6 @@ void init_settings() {
     // false and is only enabled when explicitly requested in config.json, since
     // the host supports explicit-flush persistent maps (see the note above).
     global_settings.buffer_coherent_as_flush = (bufferCoherentAsFlushCfg > 0);
-    // Default on: an absent key (-1) keeps it enabled. Only an explicit
-    // "presentFallback": 0 turns it off.
-    global_settings.present_fallback = (presentFallbackCfg != 0);
     global_settings.self_promotion = (selfPromotionCfg != 0);
     global_settings.activate_on_create = (activateOnCreateCfg != 0);
     global_settings.proc_address_own = (procAddressOwnCfg != 0);
@@ -278,8 +264,6 @@ void init_settings() {
           static_cast<int>(global_settings.angle_depth_clear_fix_mode))
     LOG_V("[MobileGlues] Setting: bufferCoherentAsFlush       = %i",
           static_cast<int>(global_settings.buffer_coherent_as_flush))
-    LOG_V("[MobileGlues] Setting: presentFallback             = %i",
-          static_cast<int>(global_settings.present_fallback))
     LOG_V("[MobileGlues] Setting: selfPromotion               = %i",
           static_cast<int>(global_settings.self_promotion))
     LOG_V("[MobileGlues] Setting: activateOnCreate            = %i",

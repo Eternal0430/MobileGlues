@@ -122,6 +122,33 @@ bool ForgetWindowSurface(EGLSurface surface) {
     return true;
 }
 
+// The surface the backend will present from. MobileGL keeps exactly one such
+// slot, g_Surface, and both MakeCurrent() and Present() use it:
+//
+//     DirectGLES::MakeCurrent:  eglMakeCurrent(g_Display, g_Surface, g_Surface, g_Context)
+//     DirectGLES::Present:      eglSwapBuffers(g_Display, g_Surface)
+//
+// Neither takes the surface from the application's arguments, which is why an
+// application holding a stale handle cannot break MobileGL's swap chain. This
+// library passed the caller's surface straight through, so a stale handle went
+// to the host and the swap was lost.
+//
+// Updated when the application successfully binds: that is the point where a
+// surface becomes the one being drawn into, and it is what MobileGL's
+// MakeEGLCurrent does (if draw != m_eglSurface -> ActivateEGLSurface(draw)).
+void RecordCurrentWindowSurface(EGLSurface surface) {
+    if (surface == EGL_NO_SURFACE) return;
+    std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
+    if (surface == g_live_window_surface) return;
+    if (std::find(g_stale_window_surfaces.begin(), g_stale_window_surfaces.end(), surface) ==
+            g_stale_window_surfaces.end() &&
+        surface != g_live_window_surface) {
+        return;  // not a window surface we track
+    }
+    g_live_window_surface = surface;
+    LOG_W_FORCE("the surface this library presents from is now %p (the application bound it)", surface);
+}
+
 // Maps a stale window-surface handle onto the live one. Anything else is
 // returned unchanged.
 EGLSurface ResolveWindowSurface(EGLDisplay, EGLSurface surface) {
@@ -264,13 +291,13 @@ void mg_egl_forget_surface(EGLSurface surface) {
     LOG_W_FORCE("forgot surface %p after the driver rejected it — it will not be used again", surface);
 }
 
-// from_fallback says who actually presented. Without it the log below claims
-// "the application presents from" even when this library's own fallback did the
-// swap, because the two are indistinguishable from inside this function. That
-// misread sent several rounds of debugging down the wrong path: the line
-// appeared in a log where the fallback counter kept climbing, which looks like a
-// working swap chain although the application had never presented at all.
-void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok, bool from_fallback) {
+// The present fallback was removed, so every swap reaching this function now
+// really is the application presenting — the line below can say so without
+// qualification. It previously had a from_fallback parameter because the fallback
+// called in here too, and the resulting "the application presents from" line
+// appeared in logs where the application had in fact never presented. That
+// misread sent several rounds of debugging down the wrong path.
+void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok) {
     if (ok != EGL_TRUE || surface == EGL_NO_SURFACE) return;
 
     std::lock_guard<std::mutex> lock(g_target_mutex);
@@ -294,7 +321,7 @@ void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok, bool fr
         g_target_generation.fetch_add(1, std::memory_order_acq_rel);
         LOG_W_FORCE("eglSwapBuffers: this is the surface %s presents from: %p, presented by "
                     "pthread=%lu%s",
-                    from_fallback ? "the PRESENT FALLBACK" : "the application", surface,
+                    "the application", surface,
                     (unsigned long)pthread_self(), first ? "" : " (changed from the previous one)");
     } else if (g_target.presenting_thread != 0 && !pthread_equal(g_target.presenting_thread, pthread_self())) {
         // Worth reporting: if the presenting thread moves, the render thread
@@ -599,6 +626,7 @@ extern "C"
                         egl_eglGetError(), dpy, draw, ctx);
         }
         mg_egl_note_make_current(dpy, draw, read, ctx, ok);
+        if (ok == EGL_TRUE) RecordCurrentWindowSurface(draw);
         return ok;
     }
 
@@ -678,7 +706,6 @@ extern "C"
         // The application presented on its own, so the present fallback has
         // nothing left to do. Turned off permanently: if a real swap chain is
         // working, adding a second one would only cause tearing.
-        mg_egl_note_app_swap();
         mg_egl_note_swap(dpy, surface, result);
         return result;
     }
@@ -722,7 +749,6 @@ extern "C"
         // points in time. A static screen hides it (both presents show the same
         // content); the moment the camera moves, the two presents carry
         // different frames and the view snaps backwards.
-        mg_egl_note_app_swap();
         mg_egl_note_swap(dpy, surface, result);
         return result;
     }
@@ -745,7 +771,6 @@ extern "C"
         }
         // See the note in eglSwapBuffersWithDamageEXT: stopping the present
         // fallback here is what keeps two swap chains from running at once.
-        mg_egl_note_app_swap();
         mg_egl_note_swap(dpy, surface, result);
         return result;
     }

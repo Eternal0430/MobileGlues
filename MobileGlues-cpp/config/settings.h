@@ -188,7 +188,6 @@ struct global_settings_t {
     bool ext_timer_query;
     bool ext_direct_state_access;
     bool buffer_coherent_as_flush;
-    bool present_fallback;
     // Each of the four workarounds below can be switched off on its own, so a
     // single change in behaviour can be attributed to one of them instead of to
     // the pile. See the notes at each use site for what breaks when it is off.
