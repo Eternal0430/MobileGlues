@@ -38,8 +38,28 @@ jobs:
             -DANDROID_STL=c++_static \
             -DSTATICLIB=OFF \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_FLAGS="-Wno-error=implicit-function-declaration"
-          cmake --build build --config Release --target mobileglues
+            -DCMAKE_C_FLAGS="-Wno-error=implicit-function-declaration" > /tmp/cmake-configure.log 2>&1
+          configure_rc=$?
+          if [ $configure_rc -ne 0 ]; then
+            echo "CMAKE CONFIGURE FAILED rc=$configure_rc"
+            tail -n 60 /tmp/cmake-configure.log
+            exit $configure_rc
+          fi
+          # Keep the full log in a file instead of the step output: a verbose
+          # build log gets truncated by the Actions UI, which hides the actual
+          # error, and the raw log endpoint is not reachable from where these
+          # failures get investigated.
+          cmake --build build --config Release --target mobileglues > /tmp/cmake-build.log 2>&1
+          build_rc=$?
+          if [ $build_rc -ne 0 ]; then
+            echo "BUILD FAILED rc=$build_rc"
+            echo "---- error lines ----"
+            grep -nE "error:|error [0-9]+|FAILED|fatal error|undefined reference" /tmp/cmake-build.log | head -n 60
+            echo "---- tail ----"
+            tail -n 40 /tmp/cmake-build.log
+            exit $build_rc
+          fi
+          tail -n 5 /tmp/cmake-build.log
 
       - name: Strip shared library
         run: |
