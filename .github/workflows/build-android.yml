@@ -53,10 +53,17 @@ jobs:
           build_rc=$?
           if [ $build_rc -ne 0 ]; then
             echo "BUILD FAILED rc=$build_rc"
-            echo "---- error lines ----"
-            grep -nE "error:|error [0-9]+|FAILED|fatal error|undefined reference" /tmp/cmake-build.log | head -n 60
-            echo "---- tail ----"
-            tail -n 40 /tmp/cmake-build.log
+            # Also into the step summary: the step log gets truncated in the UI
+            # and the raw-log endpoint is not reachable from the environment
+            # where these failures are investigated, so the summary is the
+            # channel that reliably carries the message back.
+            {
+              echo '### Build errors'
+              echo '```'
+              grep -nE "error:|error [0-9]+|FAILED|fatal error|undefined reference" /tmp/cmake-build.log | head -n 40
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            grep -nE "error:|error [0-9]+|FAILED|fatal error|undefined reference" /tmp/cmake-build.log | head -n 40
             exit $build_rc
           fi
           tail -n 5 /tmp/cmake-build.log
