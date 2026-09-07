@@ -111,7 +111,7 @@ repo = os.environ["GH_REPO"]
 token = os.environ["GH_TOKEN"]
 sha = os.environ.get("GITHUB_SHA", "")
 path = "ci-last-failure.md"
-ref = "ci-failure-logs"
+ref = os.environ.get("GITHUB_REF_NAME", "fix/gles-getstring-null-crash")
 body = open("/tmp/report.md", "rb").read()
 
 def api(method, url, payload=None):
@@ -129,11 +129,8 @@ def api(method, url, payload=None):
         return {}
 
 base = "https://api.github.com/repos/%s" % repo
-# Make sure the branch exists, pointing at the current commit or at main.
-main = api("GET", base + "/git/ref/heads/main") or api("GET", base + "/git/ref/heads/master")
-if main.get("object"):
-    api("POST", base + "/git/refs", {"ref": "refs/heads/" + ref, "sha": main["object"]["sha"]})
-
+# The target branch must already exist: creating one through the API silently
+# failed before, and the file was then nowhere to be found.
 existing = api("GET", "%s/contents/%s?ref=%s" % (base, path, ref))
 payload = {
     "message": "CI failure log for " + sha,
