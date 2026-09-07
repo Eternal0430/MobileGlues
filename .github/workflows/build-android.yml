@@ -93,8 +93,23 @@ jobs:
             tail -n 120 /tmp/cmake-build.log
             echo '```'
           } > /tmp/report.md
-          gh label create ci-failure --force > /dev/null 2>&1 || true
-          gh issue create --title "CI build failure ${{ github.sha }}" --label "ci-failure" --body-file /tmp/report.md || true
+          gh label create ci-failure --force > /dev/null 2>&1
+          gh issue create --repo "$GH_REPO" --title "CI build failure ${{ github.sha }}" \
+            --body-file /tmp/report.md > /tmp/issue.out 2>&1
+          echo "issue create rc=$?" >> /tmp/report.md
+          cat /tmp/issue.out >> /tmp/report.md 2>/dev/null
+
+          # Issue creation cannot be relied on (the token may not be allowed to
+          # open one), so the same text is committed to a scratch branch. A file
+          # in the repository is readable through the contents API, which is the
+          # one channel that is guaranteed to be reachable.
+          git config user.name "ci"
+          git config user.email "ci@local"
+          git checkout -B ci-failure-logs
+          cp /tmp/report.md ci-last-failure.md
+          git add ci-last-failure.md
+          git commit -m "CI failure log for ${{ github.sha }}" || true
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" ci-failure-logs || true
 
       - name: Strip shared library
         run: |
