@@ -66,52 +66,75 @@ std::atomic<unsigned> g_target_generation{0};
 // are tracked. Pbuffers and pixmaps are destroyed immediately as before.
 // ---------------------------------------------------------------------------
 std::mutex g_window_surfaces_mutex;
-// Oldest first, newest last. The last entry is the live one.
-std::vector<EGLSurface> g_window_surfaces;
-// Keep a few generations: SDL has been seen to hold more than one stale handle.
-constexpr size_t kMaxRetainedWindowSurfaces = 4;
+// The window surface currently on screen.
+EGLSurface g_live_window_surface = EGL_NO_SURFACE;
+// Handles of window surfaces that have been destroyed. They are remembered only
+// as VALUES: they are never dereferenced, so there is no use-after-free. They
+// exist purely so an operation SDL issues on a handle it still has cached can be
+// pointed at the surface that is actually on screen.
+//
+// Keeping them alive instead of destroying them was tried and had to be undone:
+// on Android an ANativeWindow can only be connected to one EGLSurface at a
+// time, so leaving the old surface attached to the reused window made
+// eglCreateWindowSurface fail outright — "unable to create an EGL window
+// surface (call to eglCreateWindowSurface failed, reporting an error of
+// EGL_SUCCESS)". The surface must really be destroyed to free the native
+// window; only its handle value is worth keeping.
+std::vector<EGLSurface> g_stale_window_surfaces;
+constexpr size_t kMaxStaleWindowSurfaces = 8;
 
-void ReallyDestroyWindowSurface(EGLDisplay dpy, EGLSurface surface) {
-    LOAD_EGL(eglDestroySurface)
-    if (!egl_eglDestroySurface) return;
-    egl_eglDestroySurface(dpy, surface);
+bool IsKnownWindowSurface(EGLSurface surface) {
+    std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
+    return surface == g_live_window_surface ||
+           std::find(g_stale_window_surfaces.begin(), g_stale_window_surfaces.end(), surface) !=
+               g_stale_window_surfaces.end();
 }
 
-void RecordWindowSurface(EGLDisplay dpy, EGLSurface surface) {
+void RecordWindowSurface(EGLDisplay, EGLSurface surface) {
     if (surface == EGL_NO_SURFACE) return;
     std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
-    if (std::find(g_window_surfaces.begin(), g_window_surfaces.end(), surface) != g_window_surfaces.end()) return;
-    g_window_surfaces.push_back(surface);
-    LOG_W_FORCE("window surface %p recorded (%zu generations retained)", surface, g_window_surfaces.size());
-    // Really destroy only what has aged out; the rest stay alive so stale
-    // handles SDL still holds keep working.
-    while (g_window_surfaces.size() > kMaxRetainedWindowSurfaces) {
-        EGLSurface oldest = g_window_surfaces.front();
-        g_window_surfaces.erase(g_window_surfaces.begin());
-        LOG_W_FORCE("window surface %p aged out, destroying it for real", oldest);
-        ReallyDestroyWindowSurface(dpy, oldest);
-    }
+    // A driver may hand back an address it just freed. If that happens the old
+    // entry must go, or a perfectly good new surface would be treated as stale
+    // and redirected to something else.
+    g_stale_window_surfaces.erase(
+        std::remove(g_stale_window_surfaces.begin(), g_stale_window_surfaces.end(), surface),
+        g_stale_window_surfaces.end());
+    g_live_window_surface = surface;
 }
 
-bool IsTrackedWindowSurface(EGLSurface surface) {
+// Called when the application destroys a window surface. Returns true if the
+// caller should skip the real destroy (it was already done).
+bool ForgetWindowSurface(EGLSurface surface) {
     std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
-    return std::find(g_window_surfaces.begin(), g_window_surfaces.end(), surface) != g_window_surfaces.end();
+    if (surface != g_live_window_surface &&
+        std::find(g_stale_window_surfaces.begin(), g_stale_window_surfaces.end(), surface) ==
+            g_stale_window_surfaces.end()) {
+        return false;  // not a window surface we track
+    }
+    if (surface == g_live_window_surface) g_live_window_surface = EGL_NO_SURFACE;
+    g_stale_window_surfaces.erase(
+        std::remove(g_stale_window_surfaces.begin(), g_stale_window_surfaces.end(), surface),
+        g_stale_window_surfaces.end());
+    g_stale_window_surfaces.push_back(surface);
+    while (g_stale_window_surfaces.size() > kMaxStaleWindowSurfaces) {
+        g_stale_window_surfaces.erase(g_stale_window_surfaces.begin());
+    }
+    return true;
 }
 
 // Maps a stale window-surface handle onto the live one. Anything else is
 // returned unchanged.
-EGLSurface ResolveWindowSurface(EGLDisplay dpy, EGLSurface surface) {
-    (void)dpy;
+EGLSurface ResolveWindowSurface(EGLDisplay, EGLSurface surface) {
     std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
-    if (g_window_surfaces.empty()) return surface;
-    const EGLSurface live = g_window_surfaces.back();
-    if (surface == live) return surface;
-    if (std::find(g_window_surfaces.begin(), g_window_surfaces.end(), surface) == g_window_surfaces.end()) {
-        return surface;  // not a tracked window surface; leave it alone
+    if (surface == EGL_NO_SURFACE || g_live_window_surface == EGL_NO_SURFACE) return surface;
+    if (surface == g_live_window_surface) return surface;
+    if (std::find(g_stale_window_surfaces.begin(), g_stale_window_surfaces.end(), surface) ==
+        g_stale_window_surfaces.end()) {
+        return surface;  // not a window surface we know about; leave it alone
     }
     LOG_W_FORCE("window surface %p is stale (SDL reused its window) — redirecting this operation to the live surface %p",
-                surface, live);
-    return live;
+                surface, g_live_window_surface);
+    return g_live_window_surface;
 }
 
 } // namespace
@@ -443,22 +466,25 @@ extern "C"
         mg_egl_note_call(__func__);
         LOG_D("eglDestroySurface, dpy: %p, surface: %p", dpy, surface);
 
-        // A window surface is kept alive: SDL caches the handle inside its own
-        // window and keeps using it after asking for it to be destroyed. Really
-        // destroying it here is what left SDL presenting to a dead surface in
-        // the first place. It is destroyed later, when it ages out of the
-        // history — see RecordWindowSurface.
-        if (IsTrackedWindowSurface(surface)) {
-            LOG_W_FORCE("eglDestroySurface(%p): window surface kept alive — SDL may still hold this handle and use it "
-                        "to present; it will be destroyed once it ages out",
-                        surface);
-            mg_egl_note_destroy_surface(dpy, surface);
-            return EGL_TRUE;
-        }
+        // A window surface must really be destroyed: the native window behind it
+        // can only be attached to one EGLSurface at a time, and SDL creates the
+        // next surface for the SAME native window right after this. Keeping the
+        // old one alive made that next eglCreateWindowSurface fail.
+        //
+        // Its handle value is remembered so operations SDL still issues on the
+        // stale handle can be redirected to the live surface.
+        const bool known = ForgetWindowSurface(surface);
 
         LOAD_EGL(eglDestroySurface)
         EGLBoolean ok = egl_eglDestroySurface(dpy, surface);
-        if (ok == EGL_TRUE) mg_egl_note_destroy_surface(dpy, surface);
+        if (ok == EGL_TRUE) {
+            if (known) {
+                LOG_W_FORCE("eglDestroySurface(%p): destroyed; handle remembered so SDL's cached copy of it still "
+                            "resolves to the live surface",
+                            surface);
+            }
+            mg_egl_note_destroy_surface(dpy, surface);
+        }
         return ok;
     }
 
