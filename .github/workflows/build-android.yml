@@ -3,6 +3,9 @@ on: [push, workflow_dispatch]
 jobs:
   build-android:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     env:
       NDK_VERSION: 27.3.13750724
       ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/27.3.13750724
@@ -67,6 +70,31 @@ jobs:
             exit $build_rc
           fi
           tail -n 5 /tmp/cmake-build.log
+
+      - name: Report build errors where they can be read
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # The raw-log endpoint is not reachable from where these failures get
+          # investigated, and the step log is truncated in the UI, so the errors
+          # are published into an issue where they can actually be read.
+          {
+            echo "Build failed for ${{ github.sha }} (run ${{ github.run_id }})"
+            echo ""
+            echo "## Errors"
+            echo '```'
+            grep -nE "error:|error [0-9]+|FAILED|fatal error|undefined reference" /tmp/cmake-build.log | head -n 60
+            echo '```'
+            echo ""
+            echo "## Tail of build log"
+            echo '```'
+            tail -n 120 /tmp/cmake-build.log
+            echo '```'
+          } > /tmp/report.md
+          gh label create ci-failure --force > /dev/null 2>&1 || true
+          gh issue create --title "CI build failure ${{ github.sha }}" --label "ci-failure" --body-file /tmp/report.md || true
 
       - name: Strip shared library
         run: |
