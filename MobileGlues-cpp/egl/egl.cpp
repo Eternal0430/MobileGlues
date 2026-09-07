@@ -84,13 +84,6 @@ EGLSurface g_live_window_surface = EGL_NO_SURFACE;
 std::vector<EGLSurface> g_stale_window_surfaces;
 constexpr size_t kMaxStaleWindowSurfaces = 8;
 
-bool IsKnownWindowSurface(EGLSurface surface) {
-    std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
-    return surface == g_live_window_surface ||
-           std::find(g_stale_window_surfaces.begin(), g_stale_window_surfaces.end(), surface) !=
-               g_stale_window_surfaces.end();
-}
-
 void RecordWindowSurface(EGLDisplay, EGLSurface surface) {
     if (surface == EGL_NO_SURFACE) return;
     std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
