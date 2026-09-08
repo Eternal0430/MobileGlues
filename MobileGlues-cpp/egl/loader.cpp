@@ -671,6 +671,52 @@ void VerifyContextStillCurrent(unsigned long calls_on_this_thread) {
 std::atomic<unsigned long> g_guarded_calls{0};
 std::atomic<bool> g_watchdog_started{false};
 
+// Probe SDL's own state.
+//
+// Every swap has to pass this gate before any EGL function is reached
+// (src/video/SDL_video.c):
+//
+//     bool SDL_GL_SwapWindow(SDL_Window *window) {
+//         if (!(window->flags & SDL_WINDOW_OPENGL)) return SDL_SetError(...);
+//         if (SDL_GL_GetCurrentWindow() != window)  return SDL_SetError(...);
+//         return _this->GL_SwapWindow(_this, window);
+//     }
+//
+// and the value it compares against is thread local, set only when a bind
+// succeeds:
+//
+//     if (result) { _this->current_glwin = window;
+//                   SDL_SetTLS(&_this->current_glwin_tls, window, NULL); }
+//
+// The game never reaches eglSwapBuffers in any logged session, so either that
+// comparison fails or the swap is never requested. Both look identical from
+// inside this library — unless SDL is asked directly. It is in the same process
+// and the launcher already resolves it the same way (sdl_hook.c uses
+// dlopen("libSDL3.so", RTLD_NOLOAD)), so this is a plain read-only query.
+static void ProbeSdlSwapGate(int tick) {
+    void* sdl = dlopen("libSDL3.so", RTLD_NOLOAD);
+    if (!sdl) {
+        LOG_W_FORCE("watchdog #%d: SDL probe — libSDL3.so is not loaded in this process", tick);
+        return;
+    }
+    auto get_window = reinterpret_cast<void* (*)()>(dlsym(sdl, "SDL_GL_GetCurrentWindow"));
+    auto get_context = reinterpret_cast<void* (*)()>(dlsym(sdl, "SDL_GL_GetCurrentContext"));
+    void* swap_fn = dlsym(sdl, "SDL_GL_SwapWindow");
+
+    if (!get_window || !get_context) {
+        LOG_W_FORCE("watchdog #%d: SDL probe — SDL3 loaded but the GL current-window accessors are missing", tick);
+        return;
+    }
+    void* window = get_window();
+    void* context = get_context();
+    LOG_W_FORCE("watchdog #%d: SDL probe — SDL_GL_GetCurrentWindow()=%p SDL_GL_GetCurrentContext()=%p "
+                "SDL_GL_SwapWindow@%p | %s",
+                tick, window, context, swap_fn,
+                window == nullptr ? "NO CURRENT WINDOW: SDL_GL_SwapWindow would be refused by its own gate, so no "
+                                    "swap can ever reach this library"
+                                  : "a window is current, so the gate is not what is blocking the swap");
+}
+
 void WatchdogLoop() {
     unsigned long last_total = 0;
     std::vector<CallSample> last_snapshot;
@@ -705,6 +751,10 @@ void WatchdogLoop() {
         LOG_W_FORCE("watchdog #%d: the application bound its context on pthread=%lu%s", tick,
                     (unsigned long)t.binding_thread,
                     t.presenting_thread ? "" : " (eglSwapBuffers has never run, so no presenting thread is known)");
+
+        // Only asked while nothing has ever presented: once a swap arrives the
+        // question is settled and the answer stops being interesting.
+        if (!t.have_presenting && tick <= 12) ProbeSdlSwapGate(tick);
 
         const size_t n = deltas.size() < 10 ? deltas.size() : 10;
         for (size_t i = 0; i < n; ++i) {
