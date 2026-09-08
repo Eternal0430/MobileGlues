@@ -273,15 +273,12 @@ EGLBoolean mg_egl_present(EGLDisplay dpy, EGLSurface surface, bool throttle) {
     if (slot_surface != EGL_NO_SURFACE) surface = slot_surface;
     if (g_slot_display != EGL_NO_DISPLAY) dpy = g_slot_display;
 
-    if (!ValidateSurfaceOnDisplay(dpy, surface)) {
-        LOG_W_FORCE("present (MobileGL DirectGLES): refused — surface %p is not valid on dpy %p (EGL_BAD_SURFACE)",
-                    surface, dpy);
-        return EGL_FALSE;
-    }
-
-    LOAD_EGL(eglSwapBuffers)
-    if (!egl_eglSwapBuffers) return EGL_FALSE;
-
+    // Throttle BEFORE anything that can log. Present is driven from the guarded
+    // GL path, which fires on every single GL call — tens of thousands per
+    // second. A log line outside the throttle is not a diagnostic, it is a
+    // denial of service: the session that motivated this printed the refusal
+    // tens of thousands of times, drowning every other message and slowing
+    // startup to a crawl.
     constexpr long kMinPresentIntervalUs = 16000;
     if (throttle) {
         const auto now = std::chrono::steady_clock::now();
@@ -294,6 +291,20 @@ EGLBoolean mg_egl_present(EGLDisplay dpy, EGLSurface surface, bool throttle) {
         g_last_present = now;
         g_last_present_valid = true;
     }
+
+    if (!ValidateSurfaceOnDisplay(dpy, surface)) {
+        // No slot yet is the normal state during startup: extension probes and
+        // shader compilation run long before a window surface exists. Calling
+        // that a failure and logging it produced tens of thousands of identical
+        // lines. It is not an error, it is "nothing to present yet" — stay quiet.
+        if (g_live_window_surface == EGL_NO_SURFACE || g_slot_display == EGL_NO_DISPLAY) return EGL_FALSE;
+        LOG_W_FORCE("present (MobileGL DirectGLES): refused — surface %p is not valid on dpy %p (EGL_BAD_SURFACE)",
+                    surface, dpy);
+        return EGL_FALSE;
+    }
+
+    LOAD_EGL(eglSwapBuffers)
+    if (!egl_eglSwapBuffers) return EGL_FALSE;
 
     const unsigned long n = g_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
     const EGLBoolean ok = egl_eglSwapBuffers(dpy, surface);
