@@ -609,6 +609,44 @@ extern "C"
         // when it created the window, which may have been destroyed since.
         draw = ResolveWindowSurface(dpy, draw);
         read = ResolveWindowSurface(dpy, read);
+
+        // A release (null surface, null context) is refused when the current
+        // window must be preserved.
+        //
+        // Read from SDL3 (src/video/SDL_video.c). SDL_GL_MakeCurrent sets
+        // current_glwin from the *context* argument:
+        //
+        //     if (!context) { window = NULL; }
+        //     result = _this->GL_MakeCurrent(_this, window, context);
+        //     if (result) { _this->current_glwin = window; ... }
+        //
+        // so a successful release sets current_glwin to NULL. And
+        // SDL_GL_SwapWindow refuses to swap unless the window matches:
+        //
+        //     if (SDL_GL_GetCurrentWindow() != window)
+        //         return SDL_SetError("... has not been made current");
+        //
+        // with current_glwin held in thread-local storage.
+        //
+        // That is exactly this session: the launcher's "primary window reuse"
+        // hook released the context, the new window surface was created, no
+        // eglMakeCurrent followed, and every swap was then dropped inside SDL
+        // with no log line — 166222 GL calls ran while eglSwapBuffers was
+        // called zero times. Sound and input kept working; only the picture was
+        // missing.
+        //
+        // Refusing the release makes SDL's GL_MakeCurrent fail, so SDL keeps
+        // the window it already had. The next swap then passes the check and
+        // reaches EGL, where the stale handle is redirected to the live surface.
+        // This is what MobileGL gets for free, since it never lets go of its
+        // render target: MakeCurrent() always re-binds g_Surface.
+        const bool is_release = (draw == EGL_NO_SURFACE && read == EGL_NO_SURFACE && ctx == EGL_NO_CONTEXT);
+        if (is_release && global_settings.keep_current_on_release) {
+            LOG_W_FORCE("eglMakeCurrent: refusing to release the context (keepCurrentOnRelease=1) — SDL keeps its "
+                        "current window, so its swap will still reach EGL");
+            return EGL_FALSE;
+        }
+
         LOAD_EGL(eglMakeCurrent)
         EGLBoolean ok = egl_eglMakeCurrent(dpy, draw, read, ctx);
         if (ok != EGL_TRUE) {
