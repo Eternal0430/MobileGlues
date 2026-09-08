@@ -205,6 +205,61 @@ void mg_egl_record_display(EGLDisplay dpy) {
 // (tens of thousands per second). An application-driven call arrives once per
 // frame by construction, so it is never throttled — throttling it would drop
 // real frames.
+// Recovery for a creation that failed because the previous surface was still
+// attached. Destroys the recorded window surface and tries once. Corresponds to
+// the DestroyEGLContext() at the top of MobileGL's InitWindowSurface, applied
+// lazily: only when the creation has already failed, so the normal path is
+// untouched.
+static EGLSurface RetryWindowSurfaceAfterReleasingOld(EGLDisplay dpy, EGLConfig config, EGLNativeWindowType win,
+                                                      const EGLint* attrib_list) {
+    EGLSurface old_surface;
+    {
+        std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
+        old_surface = g_live_window_surface;
+    }
+    if (old_surface == EGL_NO_SURFACE) return EGL_NO_SURFACE;
+
+    LOG_W_FORCE("eglCreateWindowSurface: failed, and window surface %p is still attached to the native window — "
+                "destroying it (as MobileGL does before creating) and trying once",
+                old_surface);
+
+    LOAD_EGL(eglMakeCurrent)
+    LOAD_EGL(eglDestroySurface)
+    LOAD_EGL(eglCreateWindowSurface)
+    if (!egl_eglDestroySurface) return EGL_NO_SURFACE;
+    // Unbind first: destroying a surface that is current fails on this driver.
+    if (egl_eglMakeCurrent) egl_eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    egl_eglDestroySurface(dpy, old_surface);
+    ForgetWindowSurface(old_surface);
+
+    EGLSurface retry = egl_eglCreateWindowSurface ? egl_eglCreateWindowSurface(dpy, config, win, attrib_list)
+                                                  : EGL_NO_SURFACE;
+    LOG_W_FORCE("eglCreateWindowSurface: retry after releasing the old surface -> %p", retry);
+    return retry;
+}
+
+// ValidateSurfaceOnDisplay — the MobileGL EGLImpl::SwapBuffers gate.
+//
+//     if (!state->ValidateSurfaceOnDisplay(dpy, draw)) {
+//         state->SetError(EGL_BAD_SURFACE);
+//         return EGL_FALSE;
+//     }
+//
+// MobileGL refuses to swap a surface that does not belong to the display, and
+// BackendObject::SwapEGLBuffers then refuses again unless the draw surface is
+// the one it recorded. Both checks run BEFORE anything reaches eglSwapBuffers.
+// This library never had them: it forwarded whatever handle it was given, so a
+// surface from another display — or none at all — was passed straight to the
+// host, which silently ignored it.
+static bool ValidateSurfaceOnDisplay(EGLDisplay dpy, EGLSurface surface) {
+    if (dpy == EGL_NO_DISPLAY || surface == EGL_NO_SURFACE) return false;
+    std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
+    // The slot is authoritative: that is the surface actually on screen. A
+    // caller's handle is translated onto it, not trusted, so the only thing
+    // worth validating is that a slot exists and belongs to this display.
+    return g_live_window_surface != EGL_NO_SURFACE && g_slot_display == dpy;
+}
+
 EGLBoolean mg_egl_present(EGLDisplay dpy, EGLSurface surface, bool throttle) {
     EGLSurface slot_surface;
     {
@@ -218,7 +273,11 @@ EGLBoolean mg_egl_present(EGLDisplay dpy, EGLSurface surface, bool throttle) {
     if (slot_surface != EGL_NO_SURFACE) surface = slot_surface;
     if (g_slot_display != EGL_NO_DISPLAY) dpy = g_slot_display;
 
-    if (dpy == EGL_NO_DISPLAY || surface == EGL_NO_SURFACE) return EGL_FALSE;
+    if (!ValidateSurfaceOnDisplay(dpy, surface)) {
+        LOG_W_FORCE("present (MobileGL DirectGLES): refused — surface %p is not valid on dpy %p (EGL_BAD_SURFACE)",
+                    surface, dpy);
+        return EGL_FALSE;
+    }
 
     LOAD_EGL(eglSwapBuffers)
     if (!egl_eglSwapBuffers) return EGL_FALSE;
@@ -513,6 +572,14 @@ extern "C"
         LOG_D("eglCreateWindowSurface, dpy: %p, config: %p, win: %p, attrib_list: %p", dpy, config, win, attrib_list);
         LOAD_EGL(eglCreateWindowSurface)
         EGLSurface surf = egl_eglCreateWindowSurface(dpy, config, win, attrib_list);
+        // MobileGL destroys the old surface before creating the next one, because
+        // one ANativeWindow accepts only one EGLSurface. This library forwards
+        // the application's calls, so it cannot reorder them — but it can recover
+        // when the application got the order wrong. A failed creation here has
+        // been seen on this driver as "eglCreateWindowSurface failed, reporting an
+        // error of EGL_SUCCESS", i.e. EGL_NO_SURFACE with no error code, which is
+        // exactly the signature of the native window still being attached.
+        if (surf == EGL_NO_SURFACE) surf = RetryWindowSurfaceAfterReleasingOld(dpy, config, win, attrib_list);
         mg_egl_note_window_surface(dpy, config, surf);
         RecordWindowSurface(dpy, surf);
         mg_egl_activate_window_surface(dpy, surf);
