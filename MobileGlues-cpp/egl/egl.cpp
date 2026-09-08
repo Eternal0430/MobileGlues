@@ -14,6 +14,7 @@
 #include "../glx/lookup.h"
 #include "loader.h"
 #include <algorithm>
+#include <unordered_map>
 #include <vector>
 
 #include <atomic>
@@ -208,6 +209,96 @@ void mg_egl_record_display(EGLDisplay dpy) {
 // the DestroyEGLContext() at the top of MobileGL's InitWindowSurface, applied
 // lazily: only when the creation has already failed, so the normal path is
 // untouched.
+// ===========================================================================
+// Surface handle ownership — MobileGL's model
+//
+//     MG_State/EGLState/Core.cpp:830
+//         const auto surface = EncodeHandle<EGLSurfaceHandle>(m_nextSurfaceHandle++);
+//         m_surfaces[surface] = SurfaceObject{ ... };
+//
+// MobileGL mints its own handles and keeps the host surface beside them. The
+// application never holds a host pointer, so the host surface can be destroyed
+// and re-created underneath without the handle the application holds ever
+// changing. That is why SDL reusing a cached window is harmless there: the
+// handle it kept is still one MobileGL knows about.
+//
+// This library used to hand out the host pointer directly. Once that surface was
+// destroyed the application's copy became a dangling value, and every later
+// eglMakeCurrent / eglSwapBuffers using it failed or was silently dropped —
+// which is how the picture ended up missing.
+//
+// From here on every surface created through this library gets a handle from the
+// counter below. The host surface lives alongside it and is re-created on
+// demand.
+// ===========================================================================
+struct OwnedSurface {
+    EGLDisplay dpy = EGL_NO_DISPLAY;
+    EGLConfig config = nullptr;
+    EGLNativeWindowType win = 0;  // window surfaces only
+    bool is_window = false;
+    EGLSurface host = EGL_NO_SURFACE;
+    bool host_destroyed = false;
+};
+
+std::mutex g_owned_surfaces_mutex;
+std::unordered_map<EGLSurface, OwnedSurface> g_owned_surfaces;
+// Deliberately small integers: they cannot be mistaken for a host pointer, and
+// every handle is looked up rather than dereferenced.
+uintptr_t g_next_surface_handle = 0x1000;
+
+EGLSurface MintSurfaceHandle(const OwnedSurface& rec) {
+    std::lock_guard<std::mutex> lock(g_owned_surfaces_mutex);
+    const auto handle = reinterpret_cast<EGLSurface>(g_next_surface_handle++);
+    g_owned_surfaces[handle] = rec;
+    return handle;
+}
+
+// The handle the application holds stays valid for as long as it is not
+// explicitly forgotten, even across destruction of the host surface. When the
+// application keeps using it, the host surface is created again from the native
+// window recorded at creation time.
+static EGLSurface EnsureHostSurface(EGLSurface handle) {
+    std::lock_guard<std::mutex> lock(g_owned_surfaces_mutex);
+    auto it = g_owned_surfaces.find(handle);
+    if (it == g_owned_surfaces.end()) return handle;  // not minted here: pass through
+    OwnedSurface& rec = it->second;
+    if (rec.host != EGL_NO_SURFACE && !rec.host_destroyed) return rec.host;
+    if (!rec.is_window) return EGL_NO_SURFACE;
+
+    LOAD_EGL(eglCreateWindowSurface)
+    if (!egl_eglCreateWindowSurface) return EGL_NO_SURFACE;
+    rec.host = egl_eglCreateWindowSurface(rec.dpy, rec.config, rec.win, nullptr);
+    rec.host_destroyed = (rec.host == EGL_NO_SURFACE);
+    LOG_W_FORCE("surface handle %p: host surface was gone, re-created it as %p — the application still holds this "
+                "handle, which is the point of minting handles here",
+                handle, rec.host);
+    if (rec.host != EGL_NO_SURFACE) RecordWindowSurface(rec.dpy, rec.host);
+    return rec.host;
+}
+
+// What the application last bound, so eglGetCurrentSurface can answer with the
+// handle the application knows rather than the host's.
+static thread_local EGLSurface t_current_draw_handle = EGL_NO_SURFACE;
+static thread_local EGLSurface t_current_read_handle = EGL_NO_SURFACE;
+
+// Destroy the host surface of every owned window surface bound to this native
+// window. One ANativeWindow accepts only one EGLSurface, so a creation that
+// failed for that reason can only succeed once the previous one is gone.
+static void ReleaseHostSurfacesForWindow(EGLNativeWindowType win) {
+    std::lock_guard<std::mutex> lock(g_owned_surfaces_mutex);
+    LOAD_EGL(eglDestroySurface)
+    if (!egl_eglDestroySurface) return;
+    for (auto& kv : g_owned_surfaces) {
+        OwnedSurface& rec = kv.second;
+        if (!rec.is_window || rec.win != win) continue;
+        if (rec.host == EGL_NO_SURFACE || rec.host_destroyed) continue;
+        LOG_W_FORCE("surface handle %p: releasing host surface %p so the native window is free again", kv.first,
+                    rec.host);
+        egl_eglDestroySurface(rec.dpy, rec.host);
+        rec.host_destroyed = true;
+    }
+}
+
 static EGLSurface RetryWindowSurfaceAfterReleasingOld(EGLDisplay dpy, EGLConfig config, EGLNativeWindowType win,
                                                       const EGLint* attrib_list) {
     EGLSurface old_surface;
@@ -218,20 +309,19 @@ static EGLSurface RetryWindowSurfaceAfterReleasingOld(EGLDisplay dpy, EGLConfig 
     if (old_surface == EGL_NO_SURFACE) return EGL_NO_SURFACE;
 
     LOG_W_FORCE("eglCreateWindowSurface: failed, and window surface %p is still attached to the native window — "
-                "destroying it (as MobileGL does before creating) and trying once",
+                "releasing it (as MobileGL does before creating) and trying once",
                 old_surface);
 
-    LOAD_EGL(eglMakeCurrent)
-    LOAD_EGL(eglDestroySurface)
     LOAD_EGL(eglCreateWindowSurface)
-    if (!egl_eglDestroySurface) return EGL_NO_SURFACE;
-    // Unbind first: destroying a surface that is current fails on this driver.
-    if (egl_eglMakeCurrent) egl_eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    egl_eglDestroySurface(dpy, old_surface);
+    if (!egl_eglCreateWindowSurface) return EGL_NO_SURFACE;
+    // Now that handles are minted here, the old surface may be one of ours even
+    // when the application's handle differs, so release by native window.
+    ReleaseHostSurfacesForWindow(win);
+    LOAD_EGL(eglDestroySurface)
+    if (egl_eglDestroySurface) egl_eglDestroySurface(dpy, old_surface);
     ForgetWindowSurface(old_surface);
 
-    EGLSurface retry = egl_eglCreateWindowSurface ? egl_eglCreateWindowSurface(dpy, config, win, attrib_list)
-                                                  : EGL_NO_SURFACE;
+    EGLSurface retry = egl_eglCreateWindowSurface(dpy, config, win, attrib_list);
     LOG_W_FORCE("eglCreateWindowSurface: retry after releasing the old surface -> %p", retry);
     return retry;
 }
@@ -568,10 +658,19 @@ extern "C"
         // error of EGL_SUCCESS", i.e. EGL_NO_SURFACE with no error code, which is
         // exactly the signature of the native window still being attached.
         if (surf == EGL_NO_SURFACE) surf = RetryWindowSurfaceAfterReleasingOld(dpy, config, win, attrib_list);
+        if (surf == EGL_NO_SURFACE) return EGL_NO_SURFACE;
         mg_egl_note_window_surface(dpy, config, surf);
         RecordWindowSurface(dpy, surf);
         mg_egl_activate_window_surface(dpy, surf);
-        return surf;
+
+        OwnedSurface rec;
+        rec.dpy = dpy; rec.config = config; rec.win = win;
+        rec.is_window = true; rec.host = surf;
+        const EGLSurface handle = MintSurfaceHandle(rec);
+        LOG_W_FORCE("eglCreateWindowSurface: host surface %p — handing the application handle %p (ours, not the "
+                    "host's, so it stays valid)",
+                    surf, handle);
+        return handle;
     }
 
     // EGL 1.5 platform surface creation.
@@ -603,17 +702,29 @@ extern "C"
         const std::vector<EGLint> narrow = NarrowAttribs(attrib_list);
         EGLSurface surf =
             egl_eglCreatePlatformWindowSurface(dpy, config, native_window, narrow.empty() ? nullptr : narrow.data());
+        if (surf == EGL_NO_SURFACE) return EGL_NO_SURFACE;
         mg_egl_note_window_surface(dpy, config, surf);
         RecordWindowSurface(dpy, surf);
         mg_egl_activate_window_surface(dpy, surf);
-        return surf;
+
+        OwnedSurface rec;
+        rec.dpy = dpy; rec.config = config;
+        rec.win = reinterpret_cast<EGLNativeWindowType>(native_window);
+        rec.is_window = true; rec.host = surf;
+        const EGLSurface handle = MintSurfaceHandle(rec);
+        LOG_W_FORCE("eglCreatePlatformWindowSurface: host surface %p — handing the application handle %p", surf, handle);
+        return handle;
     }
 
     EGL_API EGLSurface eglCreatePbufferSurface(EGLDisplay dpy, EGLConfig config, const EGLint* attrib_list) {
         mg_egl_note_call(__func__);
         LOG_D("eglCreatePbufferSurface, dpy: %p, config: %p, attrib_list: %p", dpy, config, attrib_list);
         LOAD_EGL(eglCreatePbufferSurface)
-        return egl_eglCreatePbufferSurface(dpy, config, attrib_list);
+        const EGLSurface surf = egl_eglCreatePbufferSurface(dpy, config, attrib_list);
+        if (surf == EGL_NO_SURFACE) return EGL_NO_SURFACE;
+        OwnedSurface rec;
+        rec.dpy = dpy; rec.config = config; rec.host = surf;
+        return MintSurfaceHandle(rec);
     }
 
     EGL_API EGLSurface eglCreatePixmapSurface(EGLDisplay dpy, EGLConfig config, EGLNativePixmapType pixmap,
@@ -623,7 +734,11 @@ extern "C"
               "%p",
               dpy, config, pixmap, attrib_list);
         LOAD_EGL(eglCreatePixmapSurface)
-        return egl_eglCreatePixmapSurface(dpy, config, pixmap, attrib_list);
+        const EGLSurface surf = egl_eglCreatePixmapSurface(dpy, config, pixmap, attrib_list);
+        if (surf == EGL_NO_SURFACE) return EGL_NO_SURFACE;
+        OwnedSurface rec;
+        rec.dpy = dpy; rec.config = config; rec.host = surf;
+        return MintSurfaceHandle(rec);
     }
 
     EGL_API EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface surface) {
@@ -637,19 +752,38 @@ extern "C"
         //
         // Its handle value is remembered so operations SDL still issues on the
         // stale handle can be redirected to the live surface.
-        const bool known = ForgetWindowSurface(surface);
-
-        LOAD_EGL(eglDestroySurface)
-        EGLBoolean ok = egl_eglDestroySurface(dpy, surface);
-        if (ok == EGL_TRUE) {
-            if (known) {
-                LOG_W_FORCE("eglDestroySurface(%p): destroyed; handle remembered so SDL's cached copy of it still "
-                            "resolves to the live surface",
-                            surface);
+        EGLSurface host = EGL_NO_SURFACE;
+        bool owned = false;
+        {
+            std::lock_guard<std::mutex> lock(g_owned_surfaces_mutex);
+            auto it = g_owned_surfaces.find(surface);
+            if (it != g_owned_surfaces.end()) {
+                owned = true;
+                host = it->second.host;
+                it->second.host_destroyed = true;
             }
-            mg_egl_note_destroy_surface(dpy, surface);
         }
-        return ok;
+        if (!owned) {
+            // Not minted here: an older caller passing a raw host handle.
+            const bool known = ForgetWindowSurface(surface);
+            LOAD_EGL(eglDestroySurface)
+            EGLBoolean ok = egl_eglDestroySurface(dpy, surface);
+            if (ok == EGL_TRUE) {
+                if (known) LOG_W_FORCE("eglDestroySurface(%p): raw host surface destroyed", surface);
+                mg_egl_note_destroy_surface(dpy, surface);
+            }
+            return ok;
+        }
+        if (host != EGL_NO_SURFACE) {
+            LOAD_EGL(eglDestroySurface)
+            egl_eglDestroySurface(dpy, host);
+            ForgetWindowSurface(host);
+            mg_egl_note_destroy_surface(dpy, host);
+            LOG_W_FORCE("eglDestroySurface(%p): host surface %p destroyed; the handle the application holds stays "
+                        "valid and will be re-created on next use",
+                        surface, host);
+        }
+        return EGL_TRUE;
     }
 
     EGL_API EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface surface, EGLint attribute, EGLint* value) {
@@ -657,7 +791,7 @@ extern "C"
         mg_egl_note_call(__func__);
         LOG_D("eglQuerySurface, dpy: %p, surface: %p, attribute: %d, value: %p", dpy, surface, attribute, value);
         LOAD_EGL(eglQuerySurface)
-        return egl_eglQuerySurface(dpy, surface, attribute, value);
+        return egl_eglQuerySurface(dpy, EnsureHostSurface(surface), attribute, value);
     }
 
     EGL_API EGLBoolean eglBindAPI(EGLenum api) {
@@ -702,21 +836,21 @@ extern "C"
         mg_egl_note_call(__func__);
         LOG_D("eglSurfaceAttrib, dpy: %p, surface: %p, attribute: %d, value: %d", dpy, surface, attribute, value);
         LOAD_EGL(eglSurfaceAttrib)
-        return egl_eglSurfaceAttrib(dpy, surface, attribute, value);
+        return egl_eglSurfaceAttrib(dpy, EnsureHostSurface(surface), attribute, value);
     }
 
     EGL_API EGLBoolean eglBindTexImage(EGLDisplay dpy, EGLSurface surface, EGLint buffer) {
         mg_egl_note_call(__func__);
         LOG_D("eglBindTexImage, dpy: %p, surface: %p, buffer: %d", dpy, surface, buffer);
         LOAD_EGL(eglBindTexImage)
-        return egl_eglBindTexImage(dpy, surface, buffer);
+        return egl_eglBindTexImage(dpy, EnsureHostSurface(surface), buffer);
     }
 
     EGL_API EGLBoolean eglReleaseTexImage(EGLDisplay dpy, EGLSurface surface, EGLint buffer) {
         mg_egl_note_call(__func__);
         LOG_D("eglReleaseTexImage, dpy: %p, surface: %p, buffer: %d", dpy, surface, buffer);
         LOAD_EGL(eglReleaseTexImage)
-        return egl_eglReleaseTexImage(dpy, surface, buffer);
+        return egl_eglReleaseTexImage(dpy, EnsureHostSurface(surface), buffer);
     }
 
     EGL_API EGLBoolean eglSwapInterval(EGLDisplay dpy, EGLint interval) {
@@ -750,21 +884,25 @@ extern "C"
         LOG_D("eglMakeCurrent, dpy: %p, draw: %p, read: %p, ctx: %p", dpy, draw, read, ctx);
         // Same stale-handle problem as the swap: SDL binds the surface it cached
         // when it created the window, which may have been destroyed since.
-        draw = ResolveWindowSurface(dpy, draw);
-        read = ResolveWindowSurface(dpy, read);
+        const EGLSurface host_draw = ResolveWindowSurface(dpy, EnsureHostSurface(draw));
+        const EGLSurface host_read = ResolveWindowSurface(dpy, EnsureHostSurface(read));
 
         LOAD_EGL(eglMakeCurrent)
-        EGLBoolean ok = egl_eglMakeCurrent(dpy, draw, read, ctx);
+        EGLBoolean ok = egl_eglMakeCurrent(dpy, host_draw, host_read, ctx);
         if (ok != EGL_TRUE) {
             // Previously invisible. A refused bind is exactly the kind of thing
             // that leaves the application unable to present, and it was being
             // dropped on the floor with no trace.
             LOAD_EGL(eglGetError)
             LOG_W_FORCE("eglMakeCurrent: the application's bind FAILED (0x%x) — dpy=%p draw=%p ctx=%p",
-                        egl_eglGetError(), dpy, draw, ctx);
+                        egl_eglGetError(), dpy, host_draw, ctx);
         }
-        mg_egl_note_make_current(dpy, draw, read, ctx, ok);
-        if (ok == EGL_TRUE) RecordCurrentWindowSurface(draw);
+        mg_egl_note_make_current(dpy, host_draw, host_read, ctx, ok);
+        if (ok == EGL_TRUE) {
+            RecordCurrentWindowSurface(host_draw);
+            t_current_draw_handle = draw;
+            t_current_read_handle = read;
+        }
         return ok;
     }
 
@@ -779,7 +917,15 @@ extern "C"
         mg_egl_note_call(__func__);
         LOG_D("eglGetCurrentSurface, readdraw: %d", readdraw);
         LOAD_EGL(eglGetCurrentSurface)
-        return egl_eglGetCurrentSurface(readdraw);
+        const EGLSurface theirs = egl_eglGetCurrentSurface(readdraw);
+        // Answer with the handle the application was given, not the host's.
+        const EGLSurface mine = (readdraw == EGL_READ) ? t_current_read_handle : t_current_draw_handle;
+        if (mine != EGL_NO_SURFACE) {
+            std::lock_guard<std::mutex> lock(g_owned_surfaces_mutex);
+            auto it = g_owned_surfaces.find(mine);
+            if (it != g_owned_surfaces.end() && it->second.host == theirs) return mine;
+        }
+        return theirs;
     }
 
     EGL_API EGLDisplay eglGetCurrentDisplay(void) {
@@ -827,7 +973,7 @@ extern "C"
         // SDL presents through the handle cached in its own window, which is a
         // surface it has already asked to destroy. Redirect it to the live one
         // so this present actually lands.
-        surface = ResolveWindowSurface(dpy, surface);
+        surface = ResolveWindowSurface(dpy, EnsureHostSurface(surface));
         // FSR upscales the finished frame, so it has to run BEFORE the swap.
         // It used to run after one swap and then swap again, which put two
         // presents on the same surface per frame — one without FSR and one
@@ -866,7 +1012,7 @@ extern "C"
         LOG_W_FORCE("EGL-TRACE: eglSwapBuffersWithDamageEXT called surface=%p n_rects=%d", surface, n_rects);
         mg_egl_note_call(__func__);
         LOG_D("eglSwapBuffersWithDamageEXT, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
-        surface = ResolveWindowSurface(dpy, surface);
+        surface = ResolveWindowSurface(dpy, EnsureHostSurface(surface));
         LOAD_EGL(eglSwapBuffersWithDamageEXT)
         if (!egl_eglSwapBuffersWithDamageEXT) {
             // Not available: present through the one path instead of opening a
@@ -898,7 +1044,7 @@ extern "C"
         LOG_W_FORCE("EGL-TRACE: eglSwapBuffersWithDamageKHR called surface=%p n_rects=%d", surface, n_rects);
         mg_egl_note_call(__func__);
         LOG_D("eglSwapBuffersWithDamageKHR, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
-        surface = ResolveWindowSurface(dpy, surface);
+        surface = ResolveWindowSurface(dpy, EnsureHostSurface(surface));
         LOAD_EGL(eglSwapBuffersWithDamageKHR)
         if (!egl_eglSwapBuffersWithDamageKHR) {
             LOG_W_FORCE("eglSwapBuffersWithDamageKHR: unavailable, presenting through the single path for surface %p",
@@ -920,7 +1066,7 @@ extern "C"
         mg_egl_note_call(__func__);
         LOG_D("eglCopyBuffers, dpy: %p, surface: %p, target: %p", dpy, surface, target);
         LOAD_EGL(eglCopyBuffers)
-        return egl_eglCopyBuffers(dpy, surface, target);
+        return egl_eglCopyBuffers(dpy, EnsureHostSurface(surface), target);
     }
 
     EGL_API EGLDisplay eglGetPlatformDisplay(EGLenum platform, void* native_display, const EGLAttrib* attrib_list) {
