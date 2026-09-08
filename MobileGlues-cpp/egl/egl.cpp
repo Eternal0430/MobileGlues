@@ -66,45 +66,75 @@ std::atomic<unsigned> g_target_generation{0};
 // Only surfaces created by eglCreateWindowSurface / eglCreatePlatformWindowSurface
 // are tracked. Pbuffers and pixmaps are destroyed immediately as before.
 // ---------------------------------------------------------------------------
-std::mutex g_window_surfaces_mutex;
-// The window surface currently on screen.
-EGLSurface g_live_window_surface = EGL_NO_SURFACE;
-// Handles of window surfaces that have been destroyed. They are remembered only
-// as VALUES: they are never dereferenced, so there is no use-after-free. They
-// exist purely so an operation SDL issues on a handle it still has cached can be
-// pointed at the surface that is actually on screen.
+// ===========================================================================
+// Window surface — MobileGL's single-slot model
 //
-// Keeping them alive instead of destroying them was tried and had to be undone:
-// on Android an ANativeWindow can only be connected to one EGLSurface at a
-// time, so leaving the old surface attached to the reused window made
-// eglCreateWindowSurface fail outright — "unable to create an EGL window
-// surface (call to eglCreateWindowSurface failed, reporting an error of
-// EGL_SUCCESS)". The surface must really be destroyed to free the native
-// window; only its handle value is worth keeping.
+// MobileGL (MG_Backend/DirectGLES/DirectGLES.cpp) keeps exactly one of each:
+//
+//     g_Display, g_Config, g_Context, g_Surface
+//
+// and every operation goes through them:
+//
+//     InitWindowSurface(w)  DestroyEGLContext();              // old one dies first
+//                           g_Surface = eglCreateWindowSurface(g_Display, g_Config, w, nullptr)
+//                           MakeCurrent()                     // bound immediately
+//     MakeCurrent()         eglMakeCurrent(g_Display, g_Surface, g_Surface, g_Context)
+//     Present()             eglSwapBuffers(g_Display, g_Surface)
+//     DestroyEGLContext()   eglMakeCurrent(NO_SURFACE,...); eglDestroyContext; eglDestroySurface
+//
+// Two properties follow, and both matter here:
+//
+//   1. The old surface is destroyed BEFORE the new one is created. On Android a
+//      native window accepts only one EGLSurface, so any other order makes the
+//      next eglCreateWindowSurface fail outright.
+//   2. Nothing downstream reads the surface the application passed in. A stale
+//      handle still held by the caller cannot break the swap chain, because the
+//      chain is driven by the slot, not by the argument.
+//
+// This library is a pass-through rather than a backend, so it cannot ignore the
+// application's argument the way MobileGL does. It keeps the same single slot
+// and TRANSLATES whatever handle the application passes onto that slot. That is
+// what lets SDL keep using a handle it cached before the surface was destroyed.
+//
+// Only handles from eglCreateWindowSurface / eglCreatePlatformWindowSurface are
+// tracked. Pbuffers and pixmaps pass through untouched and are destroyed at once.
+// ===========================================================================
+std::mutex g_window_surfaces_mutex;
+// The one surface currently on screen. This is the slot.
+EGLSurface g_live_window_surface = EGL_NO_SURFACE;
+// Handle VALUES of destroyed window surfaces. Never dereferenced — there is no
+// use-after-free. They exist only so an operation issued on a dead handle can be
+// pointed at the live one.
 std::vector<EGLSurface> g_stale_window_surfaces;
 constexpr size_t kMaxStaleWindowSurfaces = 8;
 
+static bool IsLiveOrStale(EGLSurface surface) {
+    return surface == g_live_window_surface ||
+           std::find(g_stale_window_surfaces.begin(), g_stale_window_surfaces.end(), surface) !=
+               g_stale_window_surfaces.end();
+}
+
+// Called right after a window surface is created: it becomes the slot.
 void RecordWindowSurface(EGLDisplay, EGLSurface surface) {
     if (surface == EGL_NO_SURFACE) return;
     std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
-    // A driver may hand back an address it just freed. If that happens the old
-    // entry must go, or a perfectly good new surface would be treated as stale
-    // and redirected to something else.
+    // A driver may reuse an address it just freed. The stale entry has to go, or
+    // a perfectly good new surface would be mistaken for a dead one.
     g_stale_window_surfaces.erase(
         std::remove(g_stale_window_surfaces.begin(), g_stale_window_surfaces.end(), surface),
         g_stale_window_surfaces.end());
+    if (g_live_window_surface != surface) {
+        LOG_W_FORCE("window surface: %p is now the surface this library presents from", surface);
+    }
     g_live_window_surface = surface;
 }
 
-// Called when the application destroys a window surface. Returns true if the
-// caller should skip the real destroy (it was already done).
+// Called when the application destroys a surface. Returns true for a window
+// surface we track. The real destroy happens in eglDestroySurface either way:
+// the native window has to be released before the next surface is created.
 bool ForgetWindowSurface(EGLSurface surface) {
     std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
-    if (surface != g_live_window_surface &&
-        std::find(g_stale_window_surfaces.begin(), g_stale_window_surfaces.end(), surface) ==
-            g_stale_window_surfaces.end()) {
-        return false;  // not a window surface we track
-    }
+    if (!IsLiveOrStale(surface)) return false;
     if (surface == g_live_window_surface) g_live_window_surface = EGL_NO_SURFACE;
     g_stale_window_surfaces.erase(
         std::remove(g_stale_window_surfaces.begin(), g_stale_window_surfaces.end(), surface),
@@ -116,46 +146,23 @@ bool ForgetWindowSurface(EGLSurface surface) {
     return true;
 }
 
-// The surface the backend will present from. MobileGL keeps exactly one such
-// slot, g_Surface, and both MakeCurrent() and Present() use it:
-//
-//     DirectGLES::MakeCurrent:  eglMakeCurrent(g_Display, g_Surface, g_Surface, g_Context)
-//     DirectGLES::Present:      eglSwapBuffers(g_Display, g_Surface)
-//
-// Neither takes the surface from the application's arguments, which is why an
-// application holding a stale handle cannot break MobileGL's swap chain. This
-// library passed the caller's surface straight through, so a stale handle went
-// to the host and the swap was lost.
-//
-// Updated when the application successfully binds: that is the point where a
-// surface becomes the one being drawn into, and it is what MobileGL's
-// MakeEGLCurrent does (if draw != m_eglSurface -> ActivateEGLSurface(draw)).
+// The application bound this surface. MobileGL does the same in MakeEGLCurrent:
+// "if (draw != m_eglSurface) ActivateEGLSurface(draw)".
 void RecordCurrentWindowSurface(EGLSurface surface) {
     if (surface == EGL_NO_SURFACE) return;
     std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
+    if (!IsLiveOrStale(surface)) return;  // not ours; leave the slot alone
     if (surface == g_live_window_surface) return;
-    if (std::find(g_stale_window_surfaces.begin(), g_stale_window_surfaces.end(), surface) ==
-            g_stale_window_surfaces.end() &&
-        surface != g_live_window_surface) {
-        return;  // not a window surface we track
-    }
     g_live_window_surface = surface;
-    LOG_W_FORCE("the surface this library presents from is now %p (the application bound it)", surface);
+    LOG_W_FORCE("window surface: the application bound %p, so that is what this library presents from", surface);
 }
 
-// Maps a stale window-surface handle onto the live one. Anything else is
-// returned unchanged.
+// Translate a dead handle onto the live surface. Anything else is returned as-is.
 EGLSurface ResolveWindowSurface(EGLDisplay, EGLSurface surface) {
     std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
     if (surface == EGL_NO_SURFACE || g_live_window_surface == EGL_NO_SURFACE) return surface;
-    if (surface == g_live_window_surface) return surface;
-    if (std::find(g_stale_window_surfaces.begin(), g_stale_window_surfaces.end(), surface) ==
-        g_stale_window_surfaces.end()) {
-        return surface;  // not a window surface we know about; leave it alone
-    }
-    LOG_W_FORCE("window surface %p is stale (SDL reused its window) — redirecting this operation to the live surface %p",
-                surface, g_live_window_surface);
-    return g_live_window_surface;
+    if (IsLiveOrStale(surface)) return g_live_window_surface;
+    return surface;  // not a window surface we know about
 }
 
 } // namespace
