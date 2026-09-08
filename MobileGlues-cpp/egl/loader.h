@@ -331,7 +331,7 @@ void mg_egl_forget_surface(EGLSurface surface);
 // an entry point this library does not export, is invisible without this.
 // --- MobileGL-style present on the single surface slot ---
 void mg_egl_record_display(EGLDisplay dpy);
-EGLBoolean mg_egl_present(EGLDisplay dpy, EGLSurface surface, bool throttle);
+EGLBoolean mg_egl_present(EGLDisplay dpy, EGLSurface surface);
 
 void mg_egl_note_call(const char* entry_point);
 

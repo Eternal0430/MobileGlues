@@ -185,9 +185,6 @@ EGLSurface ResolveWindowSurface(EGLDisplay, EGLSurface surface) {
 
 static EGLDisplay g_slot_display = EGL_NO_DISPLAY;
 static std::atomic<unsigned long> g_present_count{0};
-static std::mutex g_present_mutex;
-static std::chrono::steady_clock::time_point g_last_present{};
-static bool g_last_present_valid = false;
 
 void mg_egl_record_display(EGLDisplay dpy) {
     if (dpy != EGL_NO_DISPLAY) g_slot_display = dpy;
@@ -200,11 +197,12 @@ void mg_egl_record_display(EGLDisplay dpy) {
 //     EGLImpl::SwapBuffers -> SwapEGLBuffers -> Present()
 // It is not that MobileGL has several presents; it has one, with callers.
 //
-// throttle: the swap is skipped if one already happened within the last display
-// refresh. Needed only for the guarded-call path, which fires on every GL call
-// (tens of thousands per second). An application-driven call arrives once per
-// frame by construction, so it is never throttled — throttling it would drop
-// real frames.
+// There is no pacing here, and none is needed: an application-driven call
+// arrives once per frame by construction. The library no longer presents on its
+// own. Every attempt to do so had to guess where a frame ends — a fixed
+// interval, then an idle-gap threshold — and each guess was wrong in exactly the
+// way that produces rollback: the swap lands mid-frame and the next one brings
+// the earlier contents back.
 // Recovery for a creation that failed because the previous surface was still
 // attached. Destroys the recorded window surface and tries once. Corresponds to
 // the DestroyEGLContext() at the top of MobileGL's InitWindowSurface, applied
@@ -260,7 +258,7 @@ static bool ValidateSurfaceOnDisplay(EGLDisplay dpy, EGLSurface surface) {
     return g_live_window_surface != EGL_NO_SURFACE && g_slot_display == dpy;
 }
 
-EGLBoolean mg_egl_present(EGLDisplay dpy, EGLSurface surface, bool throttle) {
+EGLBoolean mg_egl_present(EGLDisplay dpy, EGLSurface surface) {
     EGLSurface slot_surface;
     {
         std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
@@ -273,30 +271,9 @@ EGLBoolean mg_egl_present(EGLDisplay dpy, EGLSurface surface, bool throttle) {
     if (slot_surface != EGL_NO_SURFACE) surface = slot_surface;
     if (g_slot_display != EGL_NO_DISPLAY) dpy = g_slot_display;
 
-    // Throttle BEFORE anything that can log. Present is driven from the guarded
-    // GL path, which fires on every single GL call — tens of thousands per
-    // second. A log line outside the throttle is not a diagnostic, it is a
-    // denial of service: the session that motivated this printed the refusal
-    // tens of thousands of times, drowning every other message and slowing
-    // startup to a crawl.
-    constexpr long kMinPresentIntervalUs = 16000;
-    if (throttle) {
-        const auto now = std::chrono::steady_clock::now();
-        std::lock_guard<std::mutex> lock(g_present_mutex);
-        if (g_last_present_valid &&
-            std::chrono::duration_cast<std::chrono::microseconds>(now - g_last_present).count() <
-                kMinPresentIntervalUs) {
-            return EGL_TRUE;
-        }
-        g_last_present = now;
-        g_last_present_valid = true;
-    }
-
     if (!ValidateSurfaceOnDisplay(dpy, surface)) {
-        // No slot yet is the normal state during startup: extension probes and
-        // shader compilation run long before a window surface exists. Calling
-        // that a failure and logging it produced tens of thousands of identical
-        // lines. It is not an error, it is "nothing to present yet" — stay quiet.
+        // No slot yet is the ordinary state during startup: extension probes and
+        // shader compilation both run long before a window surface exists.
         if (g_live_window_surface == EGL_NO_SURFACE || g_slot_display == EGL_NO_DISPLAY) return EGL_FALSE;
         LOG_W_FORCE("present (MobileGL DirectGLES): refused — surface %p is not valid on dpy %p (EGL_BAD_SURFACE)",
                     surface, dpy);
@@ -309,8 +286,8 @@ EGLBoolean mg_egl_present(EGLDisplay dpy, EGLSurface surface, bool throttle) {
     const unsigned long n = g_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
     const EGLBoolean ok = egl_eglSwapBuffers(dpy, surface);
     if (n <= 3 || (n % 600) == 0) {
-        LOG_W_FORCE("present (MobileGL DirectGLES): #%lu eglSwapBuffers(dpy=%p, surface=%p) -> %d%s", n, dpy, surface,
-                    static_cast<int>(ok), throttle ? " (from guarded call)" : " (application called in)");
+        LOG_W_FORCE("present (MobileGL DirectGLES): #%lu eglSwapBuffers(dpy=%p, surface=%p) -> %d", n, dpy, surface,
+                    static_cast<int>(ok));
     }
     return ok;
 }
@@ -859,7 +836,7 @@ extern "C"
             ApplyFSR();
             CheckResolutionChange();
         }
-        const EGLBoolean result = mg_egl_present(dpy, surface, false);
+        const EGLBoolean result = mg_egl_present(dpy, surface);
         if (result != EGL_TRUE) {
             LOAD_EGL(eglGetError)
             LOG_W_FORCE("eglSwapBuffers: FAILED (0x%x) surface=%p", egl_eglGetError(), surface);
@@ -896,9 +873,9 @@ extern "C"
             // second one by calling back into this library's own entry point.
             LOG_W_FORCE("eglSwapBuffersWithDamageEXT: unavailable, presenting through the single path for surface %p",
                         surface);
-            return mg_egl_present(dpy, surface, false);
+            return mg_egl_present(dpy, surface);
         }
-        const EGLBoolean result = mg_egl_present(dpy, surface, false);
+        const EGLBoolean result = mg_egl_present(dpy, surface);
         if (result != EGL_TRUE) {
             LOAD_EGL(eglGetError)
             LOG_W_FORCE("eglSwapBuffersWithDamageEXT: FAILED (0x%x) surface=%p", egl_eglGetError(), surface);
@@ -926,9 +903,9 @@ extern "C"
         if (!egl_eglSwapBuffersWithDamageKHR) {
             LOG_W_FORCE("eglSwapBuffersWithDamageKHR: unavailable, presenting through the single path for surface %p",
                         surface);
-            return mg_egl_present(dpy, surface, false);
+            return mg_egl_present(dpy, surface);
         }
-        const EGLBoolean result = mg_egl_present(dpy, surface, false);
+        const EGLBoolean result = mg_egl_present(dpy, surface);
         if (result != EGL_TRUE) {
             LOAD_EGL(eglGetError)
             LOG_W_FORCE("eglSwapBuffersWithDamageKHR: FAILED (0x%x) surface=%p", egl_eglGetError(), surface);

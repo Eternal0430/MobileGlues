@@ -833,9 +833,6 @@ void mg_egl_note_guarded_call(const char* entry_point) {
     g_guarded_calls.fetch_add(1, std::memory_order_relaxed);
     histogram_add(entry_point, pthread_self());
     VerifyContextStillCurrent(t_calls);
-    // MobileGL presents from its own slot; this library drives the same call
-    // because the application's present never arrives (see mg_egl_present).
-    mg_egl_present(EGL_NO_DISPLAY, EGL_NO_SURFACE, true);
     if (!g_watchdog_started.exchange(true)) {
         // Detached and deliberately never joined: it outlives the GL session and
         // costs one wake-up every 20 seconds.
