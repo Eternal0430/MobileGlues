@@ -806,6 +806,7 @@ extern "C"
         mg_egl_note_call(__func__);
         LOG_D("eglSwapBuffersWithDamageEXT, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
         surface = ResolveWindowSurface(dpy, surface);
+        mg_egl_note_app_present();
         LOAD_EGL(eglSwapBuffersWithDamageEXT)
         if (!egl_eglSwapBuffersWithDamageEXT) {
             // Not available: fall back rather than drop the frame entirely.
@@ -836,6 +837,7 @@ extern "C"
         mg_egl_note_call(__func__);
         LOG_D("eglSwapBuffersWithDamageKHR, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
         surface = ResolveWindowSurface(dpy, surface);
+        mg_egl_note_app_present();
         LOAD_EGL(eglSwapBuffersWithDamageKHR)
         if (!egl_eglSwapBuffersWithDamageKHR) {
             LOG_W_FORCE("eglSwapBuffersWithDamageKHR: unavailable, using eglSwapBuffers for surface %p", surface);
