@@ -184,7 +184,6 @@ EGLSurface ResolveWindowSurface(EGLDisplay, EGLSurface surface) {
 } // namespace
 
 static EGLDisplay g_slot_display = EGL_NO_DISPLAY;
-static std::atomic<bool> g_app_did_present{false};
 static std::atomic<unsigned long> g_present_count{0};
 static std::mutex g_present_mutex;
 static std::chrono::steady_clock::time_point g_last_present{};
@@ -194,37 +193,44 @@ void mg_egl_record_display(EGLDisplay dpy) {
     if (dpy != EGL_NO_DISPLAY) g_slot_display = dpy;
 }
 
-void mg_egl_note_app_present() { g_app_did_present.store(true, std::memory_order_release); }
-
-bool mg_egl_app_has_presented() { return g_app_did_present.load(std::memory_order_acquire); }
-
-void mg_egl_present_from_slot() {
-    if (g_app_did_present.load(std::memory_order_acquire)) return;  // app presents on its own
-
-    EGLSurface surface;
-    EGLDisplay dpy;
+// The ONE present. Mirrors DirectGLES::Present(), which is likewise the only
+// place that swaps and likewise takes both arguments from the slot.
+//
+// Every entry point funnels here, exactly as MobileGL's do:
+//     EGLImpl::SwapBuffers -> SwapEGLBuffers -> Present()
+// It is not that MobileGL has several presents; it has one, with callers.
+//
+// throttle: the swap is skipped if one already happened within the last display
+// refresh. Needed only for the guarded-call path, which fires on every GL call
+// (tens of thousands per second). An application-driven call arrives once per
+// frame by construction, so it is never throttled — throttling it would drop
+// real frames.
+EGLBoolean mg_egl_present(EGLDisplay dpy, EGLSurface surface, bool throttle) {
+    EGLSurface slot_surface;
     {
         std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
-        surface = g_live_window_surface;
+        slot_surface = g_live_window_surface;
     }
-    dpy = g_slot_display;
-    if (dpy == EGL_NO_DISPLAY || surface == EGL_NO_SURFACE) return;
+    // MobileGL's SwapEGLBuffers rejects a draw surface that is not m_eglSurface.
+    // Here the caller's handle is not rejected but TRANSLATED: this is a
+    // pass-through library, so SDL keeps using handles it cached before the
+    // surface was destroyed. Whatever it passes, what gets swapped is the slot.
+    if (slot_surface != EGL_NO_SURFACE) surface = slot_surface;
+    if (g_slot_display != EGL_NO_DISPLAY) dpy = g_slot_display;
+
+    if (dpy == EGL_NO_DISPLAY || surface == EGL_NO_SURFACE) return EGL_FALSE;
 
     LOAD_EGL(eglSwapBuffers)
-    if (!egl_eglSwapBuffers) return;
+    if (!egl_eglSwapBuffers) return EGL_FALSE;
 
-    // One swap per display refresh at most. Without this the swap would be
-    // issued once per GL call — tens of thousands per second — which is both
-    // ruinous for performance and, because a swap is a full pipeline flush,
-    // guarantees a half-finished frame every time.
     constexpr long kMinPresentIntervalUs = 16000;
-    const auto now = std::chrono::steady_clock::now();
-    {
+    if (throttle) {
+        const auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(g_present_mutex);
         if (g_last_present_valid &&
             std::chrono::duration_cast<std::chrono::microseconds>(now - g_last_present).count() <
                 kMinPresentIntervalUs) {
-            return;
+            return EGL_TRUE;
         }
         g_last_present = now;
         g_last_present_valid = true;
@@ -233,9 +239,10 @@ void mg_egl_present_from_slot() {
     const unsigned long n = g_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
     const EGLBoolean ok = egl_eglSwapBuffers(dpy, surface);
     if (n <= 3 || (n % 600) == 0) {
-        LOG_W_FORCE("present (MobileGL-style): #%lu eglSwapBuffers(dpy=%p, surface=%p) -> %d", n, dpy, surface,
-                    static_cast<int>(ok));
+        LOG_W_FORCE("present (MobileGL DirectGLES): #%lu eglSwapBuffers(dpy=%p, surface=%p) -> %d%s", n, dpy, surface,
+                    static_cast<int>(ok), throttle ? " (from guarded call)" : " (application called in)");
     }
+    return ok;
 }
 
 
@@ -766,16 +773,15 @@ extern "C"
         // surface it has already asked to destroy. Redirect it to the live one
         // so this present actually lands.
         surface = ResolveWindowSurface(dpy, surface);
-        mg_egl_note_app_present();
-        LOAD_EGL(eglSwapBuffers)
-        EGLBoolean result;
+        // FSR upscales the finished frame, so it has to run BEFORE the swap.
+        // It used to run after one swap and then swap again, which put two
+        // presents on the same surface per frame — one without FSR and one
+        // with it — and showed as the picture snapping back and forth.
         if (global_settings.fsr1_setting != FSR1_Quality_Preset::Disabled) {
             ApplyFSR();
-            result = egl_eglSwapBuffers(dpy, surface);
             CheckResolutionChange();
-        } else {
-            result = egl_eglSwapBuffers(dpy, surface);
         }
+        const EGLBoolean result = mg_egl_present(dpy, surface, false);
         if (result != EGL_TRUE) {
             LOAD_EGL(eglGetError)
             LOG_W_FORCE("eglSwapBuffers: FAILED (0x%x) surface=%p", egl_eglGetError(), surface);
@@ -806,14 +812,15 @@ extern "C"
         mg_egl_note_call(__func__);
         LOG_D("eglSwapBuffersWithDamageEXT, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
         surface = ResolveWindowSurface(dpy, surface);
-        mg_egl_note_app_present();
         LOAD_EGL(eglSwapBuffersWithDamageEXT)
         if (!egl_eglSwapBuffersWithDamageEXT) {
-            // Not available: fall back rather than drop the frame entirely.
-            LOG_W_FORCE("eglSwapBuffersWithDamageEXT: unavailable, using eglSwapBuffers for surface %p", surface);
-            return eglSwapBuffers(dpy, surface);
+            // Not available: present through the one path instead of opening a
+            // second one by calling back into this library's own entry point.
+            LOG_W_FORCE("eglSwapBuffersWithDamageEXT: unavailable, presenting through the single path for surface %p",
+                        surface);
+            return mg_egl_present(dpy, surface, false);
         }
-        const EGLBoolean result = egl_eglSwapBuffersWithDamageEXT(dpy, surface, const_cast<EGLint*>(rects), n_rects);
+        const EGLBoolean result = mg_egl_present(dpy, surface, false);
         if (result != EGL_TRUE) {
             LOAD_EGL(eglGetError)
             LOG_W_FORCE("eglSwapBuffersWithDamageEXT: FAILED (0x%x) surface=%p", egl_eglGetError(), surface);
@@ -837,13 +844,13 @@ extern "C"
         mg_egl_note_call(__func__);
         LOG_D("eglSwapBuffersWithDamageKHR, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
         surface = ResolveWindowSurface(dpy, surface);
-        mg_egl_note_app_present();
         LOAD_EGL(eglSwapBuffersWithDamageKHR)
         if (!egl_eglSwapBuffersWithDamageKHR) {
-            LOG_W_FORCE("eglSwapBuffersWithDamageKHR: unavailable, using eglSwapBuffers for surface %p", surface);
-            return eglSwapBuffers(dpy, surface);
+            LOG_W_FORCE("eglSwapBuffersWithDamageKHR: unavailable, presenting through the single path for surface %p",
+                        surface);
+            return mg_egl_present(dpy, surface, false);
         }
-        const EGLBoolean result = egl_eglSwapBuffersWithDamageKHR(dpy, surface, const_cast<EGLint*>(rects), n_rects);
+        const EGLBoolean result = mg_egl_present(dpy, surface, false);
         if (result != EGL_TRUE) {
             LOAD_EGL(eglGetError)
             LOG_W_FORCE("eglSwapBuffersWithDamageKHR: FAILED (0x%x) surface=%p", egl_eglGetError(), surface);
