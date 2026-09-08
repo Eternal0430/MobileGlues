@@ -329,6 +329,12 @@ void mg_egl_forget_surface(EGLSurface surface);
 // eglSwapBuffers never called even once, which cannot be diagnosed from inside
 // the GL layer: whether the application never asks to present, or asks through
 // an entry point this library does not export, is invisible without this.
+// --- MobileGL-style present on the single surface slot ---
+void mg_egl_record_display(EGLDisplay dpy);
+void mg_egl_present_from_slot();
+void mg_egl_note_app_present();
+bool mg_egl_app_has_presented();
+
 void mg_egl_note_call(const char* entry_point);
 
 // Called right after a window surface is created, to bind the application's

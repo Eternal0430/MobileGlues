@@ -165,7 +165,79 @@ EGLSurface ResolveWindowSurface(EGLDisplay, EGLSurface surface) {
     return surface;  // not a window surface we know about
 }
 
+// ---------------------------------------------------------------------------
+// Present — the MobileGL DirectGLES::Present counterpart
+//
+//     void Present() { ...; g_EGLFuncs.eglSwapBuffers(g_Display, g_Surface); ... }
+//
+// Same shape, same arguments: the display and the surface come from the slot,
+// never from the caller. MobileGL reaches this from its own eglSwapBuffers
+// export, after validating that the draw surface is current. This library is a
+// pass-through, so the chain is inverted: the application's present never
+// arrives (every logged session shows eglSwapBuffers called zero times, while
+// tens of thousands of GL calls run), so the slot drives the swap itself.
+//
+// Called only while no surface is current-lost and only for a window surface we
+// actually created, so it can never swap something that is not on screen.
+// ---------------------------------------------------------------------------
+
 } // namespace
+
+static EGLDisplay g_slot_display = EGL_NO_DISPLAY;
+static std::atomic<bool> g_app_did_present{false};
+static std::atomic<unsigned long> g_present_count{0};
+static std::mutex g_present_mutex;
+static std::chrono::steady_clock::time_point g_last_present{};
+static bool g_last_present_valid = false;
+
+void mg_egl_record_display(EGLDisplay dpy) {
+    if (dpy != EGL_NO_DISPLAY) g_slot_display = dpy;
+}
+
+void mg_egl_note_app_present() { g_app_did_present.store(true, std::memory_order_release); }
+
+bool mg_egl_app_has_presented() { return g_app_did_present.load(std::memory_order_acquire); }
+
+void mg_egl_present_from_slot() {
+    if (g_app_did_present.load(std::memory_order_acquire)) return;  // app presents on its own
+
+    EGLSurface surface;
+    EGLDisplay dpy;
+    {
+        std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
+        surface = g_live_window_surface;
+    }
+    dpy = g_slot_display;
+    if (dpy == EGL_NO_DISPLAY || surface == EGL_NO_SURFACE) return;
+
+    LOAD_EGL(eglSwapBuffers)
+    if (!egl_eglSwapBuffers) return;
+
+    // One swap per display refresh at most. Without this the swap would be
+    // issued once per GL call — tens of thousands per second — which is both
+    // ruinous for performance and, because a swap is a full pipeline flush,
+    // guarantees a half-finished frame every time.
+    constexpr long kMinPresentIntervalUs = 16000;
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(g_present_mutex);
+        if (g_last_present_valid &&
+            std::chrono::duration_cast<std::chrono::microseconds>(now - g_last_present).count() <
+                kMinPresentIntervalUs) {
+            return;
+        }
+        g_last_present = now;
+        g_last_present_valid = true;
+    }
+
+    const unsigned long n = g_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const EGLBoolean ok = egl_eglSwapBuffers(dpy, surface);
+    if (n <= 3 || (n % 600) == 0) {
+        LOG_W_FORCE("present (MobileGL-style): #%lu eglSwapBuffers(dpy=%p, surface=%p) -> %d", n, dpy, surface,
+                    static_cast<int>(ok));
+    }
+}
+
 
 const AppRenderTarget& mg_egl_app_target() {
     std::lock_guard<std::mutex> lock(g_target_mutex);
@@ -379,7 +451,9 @@ extern "C"
         mg_egl_note_call(__func__);
         LOG_D("eglInitialize, dpy: %p, major: %p, minor: %p", dpy, major, minor);
         LOAD_EGL(eglInitialize)
-        return egl_eglInitialize(dpy, major, minor);
+        const EGLBoolean ok = egl_eglInitialize(dpy, major, minor);
+        if (ok == EGL_TRUE) mg_egl_record_display(dpy);
+        return ok;
     }
 
     EGL_API EGLBoolean eglTerminate(EGLDisplay dpy) {
@@ -617,43 +691,6 @@ extern "C"
         draw = ResolveWindowSurface(dpy, draw);
         read = ResolveWindowSurface(dpy, read);
 
-        // A release (null surface, null context) is refused when the current
-        // window must be preserved.
-        //
-        // Read from SDL3 (src/video/SDL_video.c). SDL_GL_MakeCurrent sets
-        // current_glwin from the *context* argument:
-        //
-        //     if (!context) { window = NULL; }
-        //     result = _this->GL_MakeCurrent(_this, window, context);
-        //     if (result) { _this->current_glwin = window; ... }
-        //
-        // so a successful release sets current_glwin to NULL. And
-        // SDL_GL_SwapWindow refuses to swap unless the window matches:
-        //
-        //     if (SDL_GL_GetCurrentWindow() != window)
-        //         return SDL_SetError("... has not been made current");
-        //
-        // with current_glwin held in thread-local storage.
-        //
-        // That is exactly this session: the launcher's "primary window reuse"
-        // hook released the context, the new window surface was created, no
-        // eglMakeCurrent followed, and every swap was then dropped inside SDL
-        // with no log line — 166222 GL calls ran while eglSwapBuffers was
-        // called zero times. Sound and input kept working; only the picture was
-        // missing.
-        //
-        // Refusing the release makes SDL's GL_MakeCurrent fail, so SDL keeps
-        // the window it already had. The next swap then passes the check and
-        // reaches EGL, where the stale handle is redirected to the live surface.
-        // This is what MobileGL gets for free, since it never lets go of its
-        // render target: MakeCurrent() always re-binds g_Surface.
-        const bool is_release = (draw == EGL_NO_SURFACE && read == EGL_NO_SURFACE && ctx == EGL_NO_CONTEXT);
-        if (is_release && global_settings.keep_current_on_release) {
-            LOG_W_FORCE("eglMakeCurrent: refusing to release the context (keepCurrentOnRelease=1) — SDL keeps its "
-                        "current window, so its swap will still reach EGL");
-            return EGL_FALSE;
-        }
-
         LOAD_EGL(eglMakeCurrent)
         EGLBoolean ok = egl_eglMakeCurrent(dpy, draw, read, ctx);
         if (ok != EGL_TRUE) {
@@ -729,6 +766,7 @@ extern "C"
         // surface it has already asked to destroy. Redirect it to the live one
         // so this present actually lands.
         surface = ResolveWindowSurface(dpy, surface);
+        mg_egl_note_app_present();
         LOAD_EGL(eglSwapBuffers)
         EGLBoolean result;
         if (global_settings.fsr1_setting != FSR1_Quality_Preset::Disabled) {
