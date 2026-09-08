@@ -82,7 +82,6 @@ void init_settings() {
     int selfPromotionCfg = success ? config_get_int("selfPromotion") : -1;
     int activateOnCreateCfg = success ? config_get_int("activateOnCreate") : -1;
     int procAddressOwnCfg = success ? config_get_int("procAddressOwn") : -1;
-    int keepCurrentOnReleaseCfg = success ? config_get_int("keepCurrentOnRelease") : -1;
 
     if (customGLVersionInt < 0) {
         customGLVersionInt = 0;
@@ -217,7 +216,6 @@ void init_settings() {
     global_settings.self_promotion = (selfPromotionCfg != 0);
     global_settings.activate_on_create = (activateOnCreateCfg != 0);
     global_settings.proc_address_own = (procAddressOwnCfg != 0);
-    global_settings.keep_current_on_release = (keepCurrentOnReleaseCfg != 0);
 
     if (global_settings.angle == AngleMode::Enabled) {
         // setenv("LIBGL_GLES", "libGLESv2_angle.so", 1);
@@ -272,8 +270,6 @@ void init_settings() {
           static_cast<int>(global_settings.activate_on_create))
     LOG_V("[MobileGlues] Setting: procAddressOwn              = %i",
           static_cast<int>(global_settings.proc_address_own))
-    LOG_V("[MobileGlues] Setting: keepCurrentOnRelease        = %i",
-          static_cast<int>(global_settings.keep_current_on_release))
     if (global_settings.custom_gl_version.isEmpty()) {
         LOG_V("[MobileGlues] Setting: customGLVersion             = (default)");
     } else {

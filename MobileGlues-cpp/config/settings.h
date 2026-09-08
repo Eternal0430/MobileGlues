@@ -194,7 +194,6 @@ struct global_settings_t {
     bool self_promotion;      // dlopen(self, RTLD_NOLOAD|RTLD_GLOBAL)
     bool activate_on_create;  // bind a context to a window surface at creation
     bool proc_address_own;    // eglGetProcAddress answers from this library first
-    bool keep_current_on_release;  // refuse eglMakeCurrent(release) so SDL keeps its current window
     size_t max_glsl_cache_size;
     // Resolved backend per multi-draw entry point. Always a concrete backend
     // after init_settings_post(); never md_backend_t::Auto.

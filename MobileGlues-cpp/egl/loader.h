@@ -370,11 +370,12 @@ void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface);
 void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok);
 
 const AppRenderTarget& mg_egl_app_target();
+// Bumped whenever the record changes, so hot paths can skip re-reading it.
+unsigned mg_egl_app_target_generation();
 
 // Bumped every time the record above changes, so a thread holding an off-screen
 // fallback can notice that a real window surface has appeared and switch to it.
 // Read on every guarded GL call, so it is an atomic load and nothing more.
-unsigned mg_egl_app_target_generation();
 
 #endif // __cplusplus
 

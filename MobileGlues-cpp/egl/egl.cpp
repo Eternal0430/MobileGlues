@@ -14,6 +14,7 @@
 #include "../glx/lookup.h"
 #include "loader.h"
 #include <algorithm>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
@@ -614,7 +615,15 @@ extern "C"
         // What the application learns here decides which surface creation path
         // it takes: an EGL 1.5 version string is what makes it call
         // eglCreatePlatformWindowSurface instead of eglCreateWindowSurface.
-        LOG_W_FORCE("eglQueryString(dpy=%p, name=%d) -> %s", dpy, name, result ? result : "(null)");
+        // Truncated: the extension list runs to several thousand characters and
+        // dumping all of it buried everything printed around it.
+        if (result) {
+            const size_t len = strlen(result);
+            LOG_W_FORCE("eglQueryString(dpy=%p, name=%d) -> %zu bytes: %.120s%s", dpy, name, len, result,
+                        len > 120 ? "..." : "");
+        } else {
+            LOG_W_FORCE("eglQueryString(dpy=%p, name=%d) -> (null)", dpy, name);
+        }
         return result;
     }
 
@@ -787,7 +796,6 @@ extern "C"
     }
 
     EGL_API EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface surface, EGLint attribute, EGLint* value) {
-        LOG_W_FORCE("EGL-TRACE: eglQuerySurface called (dpy=%p)", (void*)dpy);
         mg_egl_note_call(__func__);
         LOG_D("eglQuerySurface, dpy: %p, surface: %p, attribute: %d, value: %p", dpy, surface, attribute, value);
         LOAD_EGL(eglQuerySurface)
@@ -884,49 +892,6 @@ extern "C"
         LOG_D("eglMakeCurrent, dpy: %p, draw: %p, read: %p, ctx: %p", dpy, draw, read, ctx);
         // Same stale-handle problem as the swap: SDL binds the surface it cached
         // when it created the window, which may have been destroyed since.
-        // Refuse to let go of the render target.
-        //
-        // SDL3 (src/video/SDL_video.c, SDL_GL_MakeCurrent) decides which window
-        // may be swapped from a thread-local:
-        //
-        //     if (!context) { window = NULL; }
-        //     result = _this->GL_MakeCurrent(_this, window, context);
-        //     if (result) {
-        //         _this->current_glwin = window;
-        //         SDL_SetTLS(&_this->current_glwin_tls, window, NULL);
-        //     }
-        //
-        // so a release that SUCCEEDS sets current_glwin to NULL. And
-        // SDL_GL_SwapWindow refuses to swap unless it matches:
-        //
-        //     if (SDL_GL_GetCurrentWindow() != window) return SDL_SetError(...)
-        //
-        // This session does exactly that: the launcher's "primary window reuse"
-        // hook released the context (logged at line 327), a new window surface
-        // was then created (line 340), and no eglMakeCurrent ever followed.
-        // current_glwin stayed NULL, so every swap was dropped inside SDL and
-        // eglSwapBuffers never reached this library — 324653 GL calls ran while
-        // the swap count stayed at zero. Sound and input were unaffected because
-        // they do not go through the swap.
-        //
-        // Returning EGL_FALSE makes GL_MakeCurrent fail, so SDL leaves
-        // current_glwin alone and the reused window stays current. The swap then
-        // passes the check and reaches this library.
-        const bool is_release = (draw == EGL_NO_SURFACE && read == EGL_NO_SURFACE && ctx == EGL_NO_CONTEXT);
-        if (is_release && global_settings.keep_current_on_release) {
-            EGLSurface live = EGL_NO_SURFACE;
-            {
-                std::lock_guard<std::mutex> lock(g_window_surfaces_mutex);
-                live = g_live_window_surface;
-            }
-            if (live != EGL_NO_SURFACE) {
-                LOG_W_FORCE("eglMakeCurrent: refusing to release the context (keepCurrentOnRelease=1) — SDL would "
-                            "clear its current window and drop every later swap, so the binding to %p is kept",
-                            live);
-                return EGL_FALSE;
-            }
-        }
-
         const EGLSurface host_draw = ResolveWindowSurface(dpy, EnsureHostSurface(draw));
         const EGLSurface host_read = ResolveWindowSurface(dpy, EnsureHostSurface(read));
 

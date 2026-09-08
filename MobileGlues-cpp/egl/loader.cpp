@@ -538,81 +538,6 @@ bool BindFallbackEGLContextIfNeeded() {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Call histogram
-//
-// Lock-free open addressing keyed on (calling thread, entry point name). The
-// name is a __func__ string literal, so its address is stable for the life of
-// the process and can be compared directly — no hashing of contents, no
-// allocation, no lock. Guarded calls run at several thousand per second, so
-// this has to be cheaper than what it is measuring.
-//
-// The thread is part of the key because the aggregate version could not answer
-// the question that mattered. A run measured 276k guarded calls in 20 seconds —
-// glTexParameteri, glBindTexture, glBindVertexArray, glDrawArraysInstanced —
-// a render loop at roughly 880 draws per second, while eglSwapBuffers was never
-// called once and the game logged nothing further. Without the thread, there is
-// no way to tell "the render thread is spinning without presenting" from "a
-// worker is burning GL calls that go nowhere", and those have nothing in common
-// except the symptom.
-// ---------------------------------------------------------------------------
-constexpr size_t kHistogramSlots = 512;
-
-struct CallSlot {
-    std::atomic<const char*> name{nullptr};
-    std::atomic<pthread_t> tid{0};
-    std::atomic<unsigned long> count{0};
-};
-
-CallSlot g_call_table[kHistogramSlots];
-
-void histogram_add(const char* name, pthread_t tid) {
-    const size_t mix = (reinterpret_cast<uintptr_t>(name) >> 4) ^ (static_cast<uintptr_t>(tid) * 0x9E3779B97F4A7C15ull);
-    size_t i = mix & (kHistogramSlots - 1);
-    for (size_t probe = 0; probe < kHistogramSlots; ++probe) {
-        const char* cur = g_call_table[i].name.load(std::memory_order_acquire);
-        if (cur == name && g_call_table[i].tid.load(std::memory_order_acquire) == tid) {
-            g_call_table[i].count.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-        if (cur == nullptr) {
-            const char* expected = nullptr;
-            if (g_call_table[i].name.compare_exchange_strong(expected, name, std::memory_order_acq_rel)) {
-                g_call_table[i].tid.store(tid, std::memory_order_release);
-                g_call_table[i].count.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-            // Someone else claimed the slot. If it was for this same key, count
-            // here; otherwise keep probing.
-            if (g_call_table[i].name.load(std::memory_order_acquire) == name &&
-                g_call_table[i].tid.load(std::memory_order_acquire) == tid) {
-                g_call_table[i].count.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-        }
-        i = (i + 1) & (kHistogramSlots - 1);
-    }
-    // Table full. Losing a few counts is harmless; the point is the ranking.
-}
-
-struct CallSample {
-    pthread_t tid;
-    const char* name;
-    unsigned long count;
-};
-
-std::vector<CallSample> histogram_snapshot() {
-    std::vector<CallSample> out;
-    out.reserve(64);
-    for (size_t i = 0; i < kHistogramSlots; ++i) {
-        const char* n = g_call_table[i].name.load(std::memory_order_acquire);
-        if (!n) continue;
-        out.push_back(CallSample{g_call_table[i].tid.load(std::memory_order_acquire), n,
-                                 g_call_table[i].count.load(std::memory_order_relaxed)});
-    }
-    return out;
-}
-
-// ---------------------------------------------------------------------------
 // Staleness check
 //
 // The fallback binds a context once per thread and then assumes, forever, that
@@ -671,140 +596,9 @@ void VerifyContextStillCurrent(unsigned long calls_on_this_thread) {
 std::atomic<unsigned long> g_guarded_calls{0};
 std::atomic<bool> g_watchdog_started{false};
 
-// Probe SDL's own state.
-//
-// Every swap has to pass this gate before any EGL function is reached
-// (src/video/SDL_video.c):
-//
-//     bool SDL_GL_SwapWindow(SDL_Window *window) {
-//         if (!(window->flags & SDL_WINDOW_OPENGL)) return SDL_SetError(...);
-//         if (SDL_GL_GetCurrentWindow() != window)  return SDL_SetError(...);
-//         return _this->GL_SwapWindow(_this, window);
-//     }
-//
-// and the value it compares against is thread local, set only when a bind
-// succeeds:
-//
-//     if (result) { _this->current_glwin = window;
-//                   SDL_SetTLS(&_this->current_glwin_tls, window, NULL); }
-//
-// The game never reaches eglSwapBuffers in any logged session, so either that
-// comparison fails or the swap is never requested. Both look identical from
-// inside this library — unless SDL is asked directly. It is in the same process
-// and the launcher already resolves it the same way (sdl_hook.c uses
-// dlopen("libSDL3.so", RTLD_NOLOAD)), so this is a plain read-only query.
-// MUST be called from the render thread.
-//
-// The value is thread local (SDL_video.c:5076 reads SDL_GetTLS, and it is
-// written only on a successful bind at 5064). An earlier version of this probe
-// ran on the watchdog thread and therefore always printed 0x0 — that reading
-// said nothing about the render thread and was wrong to report as a finding.
-static std::atomic<bool> g_app_target_generation_probe_done{false};
-
-// Repair SDL's own bookkeeping.
-//
-// This is the measured cause of the black screen. SDL_GL_SwapWindow refuses to
-// swap unless the window matches a value SDL keeps in thread-local storage
-// (src/video/SDL_video.c):
-//
-//     if (SDL_GL_GetCurrentWindow() != window) return SDL_SetError(...);
-//
-// and that value is written only here:
-//
-//     result = _this->GL_MakeCurrent(_this, window, context);
-//     if (result) { _this->current_glwin = window;
-//                   SDL_SetTLS(&_this->current_glwin_tls, window, NULL); }
-//
-// On the release path SDL calls Android_GLES_MakeCurrent(_this, NULL, NULL),
-// which reaches SDL_EGL_MakeCurrent — and that function DISCARDS the return
-// value of eglMakeCurrent and returns true unconditionally:
-//
-//     if (!egl_context || ...) {
-//         eglMakeCurrent(display, NO_SURFACE, NO_SURFACE, NO_CONTEXT);
-//     } else { ... }
-//     return true;
-//
-// so the bind is reported as successful and current_glwin becomes NULL. Nothing
-// re-binds afterwards, because the launcher's "primary window reuse" hook hands
-// the same window back and the game sees no reason to bind again. From then on
-// every swap is refused inside SDL and none of them ever reaches EGL — which is
-// what the logs show: hundreds of thousands of GL calls, eglSwapBuffers never
-// once called.
-//
-// Returning EGL_FALSE from our eglMakeCurrent cannot help: the return value is
-// discarded. The only way to reopen the gate is to make the bind happen through
-// SDL, so that SDL writes its own TLS. This library knows the context is in fact
-// current on a real surface (it bound it), so re-stating that fact through
-// SDL's public API is a correction, not a workaround.
-//
-// Two facts make this possible:
-//   - SDL_GLContext is the EGLContext pointer on this backend; SDL_EGL_CreateContext
-//     returns (SDL_GLContext)egl_context, and SDL_EGL_MakeCurrent casts it straight
-//     back to EGLContext.
-//   - SDL_GetWindows is exported, so the window can be enumerated.
-static thread_local bool t_in_sdl_repair = false;
-static std::atomic<bool> g_sdl_repair_done{false};
-static std::atomic<int> g_sdl_repair_attempts{0};
-
-static void RepairSdlCurrentWindow() {
-    if (t_in_sdl_repair) return;  // re-entry: this call came from SDL itself
-
-    const AppRenderTarget& t = mg_egl_app_target();
-    if (!t.have_binding || t.context == EGL_NO_CONTEXT || t.draw_surface == EGL_NO_SURFACE) return;
-
-    void* sdl = dlopen("libSDL3.so", RTLD_NOLOAD);
-    if (!sdl) return;  // SDL has not been loaded yet; a later attempt will see it
-
-    auto get_window = reinterpret_cast<void* (*)()>(dlsym(sdl, "SDL_GL_GetCurrentWindow"));
-    auto make_current = reinterpret_cast<bool (*)(void*, void*)>(dlsym(sdl, "SDL_GL_MakeCurrent"));
-    auto get_windows = reinterpret_cast<void** (*)(int*)>(dlsym(sdl, "SDL_GetWindows"));
-    if (!get_window || !make_current || !get_windows) return;
-
-    if (get_window() != nullptr) return;  // the gate is already open
-
-    int count = 0;
-    void** windows = get_windows(&count);
-    if (!windows || count <= 0) return;
-
-    t_in_sdl_repair = true;
-    const bool ok = make_current(windows[0], t.context);
-    t_in_sdl_repair = false;
-
-    LOG_W_FORCE("SDL repair: SDL_GL_GetCurrentWindow() was NULL (SDL cleared it on release, and its EGL layer "
-                "ignores the return value, so refusing the release cannot prevent it) — re-stated the bind through "
-                "SDL_GL_MakeCurrent(window=%p, ctx=%p) -> %d; current window now %p%s",
-                windows[0], t.context, static_cast<int>(ok), get_window(),
-                ok ? " (gate open)" : " (still closed)");
-}
-
-static void ProbeSdlSwapGate(const char* when) {
-    void* sdl = dlopen("libSDL3.so", RTLD_NOLOAD);
-    if (!sdl) {
-        LOG_W_FORCE("SDL probe (%s): libSDL3.so is not loaded in this process", when);
-        return;
-    }
-    auto get_window = reinterpret_cast<void* (*)()>(dlsym(sdl, "SDL_GL_GetCurrentWindow"));
-    auto get_context = reinterpret_cast<void* (*)()>(dlsym(sdl, "SDL_GL_GetCurrentContext"));
-    void* swap_fn = dlsym(sdl, "SDL_GL_SwapWindow");
-
-    if (!get_window || !get_context) {
-        LOG_W_FORCE("SDL probe (%s): SDL3 loaded but the GL current-window accessors are missing", when);
-        return;
-    }
-    void* window = get_window();
-    void* context = get_context();
-    LOG_W_FORCE("SDL probe (%s): pthread=%lu SDL_GL_GetCurrentWindow()=%p SDL_GL_GetCurrentContext()=%p "
-                "SDL_GL_SwapWindow@%p | %s",
-                when, (unsigned long)pthread_self(), window, context, swap_fn,
-                window == nullptr
-                    ? "NO CURRENT WINDOW on this thread: SDL_GL_SwapWindow is refused by its own gate here, so no "
-                      "swap can reach this library from it"
-                    : "a window IS current on this thread, so the gate is not what blocks the swap");
-}
 
 void WatchdogLoop() {
     unsigned long last_total = 0;
-    std::vector<CallSample> last_snapshot;
     int tick = 0;
 
     while (true) {
@@ -813,19 +607,6 @@ void WatchdogLoop() {
         const unsigned long now = g_guarded_calls.load(std::memory_order_relaxed);
         const unsigned long delta = now - last_total;
         last_total = now;
-
-        auto snapshot = histogram_snapshot();
-        std::vector<CallSample> deltas;
-        deltas.reserve(snapshot.size());
-        for (const auto& kv : snapshot) {
-            unsigned long before = 0;
-            for (const auto& old : last_snapshot)
-                if (old.tid == kv.tid && old.name == kv.name) { before = old.count; break; }
-            if (kv.count > before) deltas.push_back(CallSample{kv.tid, kv.name, kv.count - before});
-        }
-        std::sort(deltas.begin(), deltas.end(),
-                  [](const CallSample& a, const CallSample& b) { return a.count > b.count; });
-        last_snapshot = std::move(snapshot);
 
         const AppRenderTarget& t = mg_egl_app_target();
         LOG_W_FORCE("watchdog #%d: %lu guarded GL calls this period (%lu total)%s | window surface=%p "
@@ -836,13 +617,6 @@ void WatchdogLoop() {
         LOG_W_FORCE("watchdog #%d: the application bound its context on pthread=%lu%s", tick,
                     (unsigned long)t.binding_thread,
                     t.presenting_thread ? "" : " (eglSwapBuffers has never run, so no presenting thread is known)");
-
-
-        const size_t n = deltas.size() < 10 ? deltas.size() : 10;
-        for (size_t i = 0; i < n; ++i) {
-            LOG_W_FORCE("watchdog #%d:   pthread=%lu  %lu  %s", tick, (unsigned long)deltas[i].tid,
-                        deltas[i].count, deltas[i].name);
-        }
     }
 }
 
@@ -952,40 +726,109 @@ void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface) {
 // "undefined symbol: mg_egl_note_call(char const*)" — a fault that -fsyntax-only
 // cannot catch, because each translation unit still compiles fine on its own.
 void mg_egl_note_call(const char* entry_point) {
-    histogram_add(entry_point, pthread_self());
     if (!g_watchdog_started.exchange(true)) {
         std::thread(WatchdogLoop).detach();
     }
+}
+
+// Repair SDL's own bookkeeping — the fix for the black screen.
+//
+// SDL_GL_SwapWindow refuses to swap unless the window matches a value SDL keeps
+// in thread-local storage (src/video/SDL_video.c):
+//
+//     if (SDL_GL_GetCurrentWindow() != window) return SDL_SetError(...);
+//
+// written only on a successful bind:
+//
+//     result = _this->GL_MakeCurrent(_this, window, context);
+//     if (result) { _this->current_glwin = window;
+//                   SDL_SetTLS(&_this->current_glwin_tls, window, NULL); }
+//
+// On the release path SDL calls Android_GLES_MakeCurrent(_this, NULL, NULL),
+// which reaches SDL_EGL_MakeCurrent — and that function DISCARDS the return
+// value of eglMakeCurrent and returns true unconditionally:
+//
+//     if (!egl_context || ...) { eglMakeCurrent(display, NO_SURFACE, ...); }
+//     else { ... }
+//     return true;
+//
+// so the bind is reported successful and current_glwin becomes NULL. Nothing
+// re-binds afterwards, because the launcher's "primary window reuse" hook hands
+// the same window back and the game sees no reason to bind again. Every swap is
+// then refused inside SDL and none reaches EGL: hundreds of thousands of GL
+// calls, eglSwapBuffers never called.
+//
+// Returning EGL_FALSE from our eglMakeCurrent cannot help — the return value is
+// discarded before any check. The only way to reopen the gate is to make the
+// bind happen through SDL, so SDL writes its own TLS. This library knows the
+// context really is current on a real surface (it bound it), so re-stating the
+// fact through SDL's public API is a correction, not a workaround: the swap
+// still originates in SDL, still passes SDL's own gate, and still arrives at
+// this library's eglSwapBuffers.
+//
+// Two facts make it possible:
+//   - SDL_GLContext is the EGLContext pointer on this backend: SDL_EGL_CreateContext
+//     returns (SDL_GLContext)egl_context, and SDL_EGL_MakeCurrent casts it back.
+//   - SDL_GetWindows is exported, so the window can be enumerated.
+static bool g_sdl_repair_done = false;
+// Written only from the binding thread, and only after the modulo gate in
+// mg_egl_note_guarded_call, so a plain int needs no synchronisation.
+static std::atomic<int> g_sdl_repair_attempts{0};
+
+static void RepairSdlCurrentWindow() {
+    const AppRenderTarget& t = mg_egl_app_target();
+    if (!t.have_binding || t.context == EGL_NO_CONTEXT || t.draw_surface == EGL_NO_SURFACE) return;
+
+    void* sdl = dlopen("libSDL3.so", RTLD_NOLOAD);
+    if (!sdl) return;  // not loaded yet; a later attempt will see it
+
+    auto get_window = reinterpret_cast<void* (*)()>(dlsym(sdl, "SDL_GL_GetCurrentWindow"));
+    auto make_current = reinterpret_cast<bool (*)(void*, void*)>(dlsym(sdl, "SDL_GL_MakeCurrent"));
+    auto get_windows = reinterpret_cast<void** (*)(int*)>(dlsym(sdl, "SDL_GetWindows"));
+    if (!get_window || !make_current || !get_windows) return;
+
+    if (get_window() != nullptr) {
+        g_sdl_repair_done = true;  // the gate is open; nothing left to do
+        return;
+    }
+
+    int count = 0;
+    void** windows = get_windows(&count);
+    if (!windows || count <= 0) return;
+
+    const bool ok = make_current(windows[0], t.context);
+    LOG_W_FORCE("SDL repair: SDL_GL_GetCurrentWindow() was NULL (SDL clears it on release, and its EGL layer "
+                "ignores the return value, so refusing the release cannot prevent it) — re-stated the bind through "
+                "SDL_GL_MakeCurrent(window=%p, ctx=%p) -> %d; current window now %p%s",
+                windows[0], t.context, static_cast<int>(ok), get_window(),
+                ok ? " (gate open)" : " (still closed)");
+    if (ok) g_sdl_repair_done = true;
 }
 
 void mg_egl_note_guarded_call(const char* entry_point) {
     static thread_local unsigned long t_calls = 0;
     ++t_calls;
 
+    // One relaxed atomic increment per call. It feeds the watchdog's "is the
+    // game still drawing" line and nothing else.
     g_guarded_calls.fetch_add(1, std::memory_order_relaxed);
-    histogram_add(entry_point, pthread_self());
     VerifyContextStillCurrent(t_calls);
-    // Run on the render thread, which is the only thread whose TLS holds the
-    // answer. First call, then rarely: enough to see whether the value changes.
-    if (!g_app_target_generation_probe_done.exchange(true)) {
-        ProbeSdlSwapGate("first guarded call");
-    } else if ((t_calls % 200000) == 0) {
-        ProbeSdlSwapGate("render thread, periodic");
-    }
-    // Only on the thread that owns the binding (the gate is thread local), only
-    // while nothing has ever presented, and only a few times: once SDL's TLS is
-    // set the condition disappears.
-    if (!g_sdl_repair_done.load(std::memory_order_relaxed) && g_sdl_repair_attempts.load(std::memory_order_relaxed) < 8 &&
-        ((t_calls % 5000) == 0)) {
+
+    // The repair below is the fix for the black screen, so it has to run — but
+    // it only ever matters a handful of times, and this function is on the path
+    // of every single GL call. Everything expensive is therefore behind the
+    // cheapest possible test first: an integer modulo on a thread-local, then
+    // a plain non-atomic read. No atomic, no dlopen, no dlsym unless the cheap
+    // test has already passed.
+    if ((t_calls % 5000) == 0 && !g_sdl_repair_done) {
         const AppRenderTarget& rt = mg_egl_app_target();
-        if (rt.binding_thread == (unsigned long)pthread_self() && rt.have_binding) {
-            g_sdl_repair_attempts.fetch_add(1, std::memory_order_relaxed);
+        if (rt.have_binding && rt.binding_thread == (unsigned long)pthread_self()) {
+            const int n = g_sdl_repair_attempts.fetch_add(1, std::memory_order_relaxed) + 1;
             RepairSdlCurrentWindow();
-            if (g_sdl_repair_attempts.load(std::memory_order_relaxed) >= 8) {
-                g_sdl_repair_done.store(true, std::memory_order_relaxed);
-            }
+            if (n >= 8) g_sdl_repair_done = true;
         }
     }
+
     if (!g_watchdog_started.exchange(true)) {
         // Detached and deliberately never joined: it outlives the GL session and
         // costs one wake-up every 20 seconds.
