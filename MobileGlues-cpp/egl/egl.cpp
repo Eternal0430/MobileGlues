@@ -126,7 +126,6 @@ void RecordWindowSurface(EGLDisplay, EGLSurface surface) {
         std::remove(g_stale_window_surfaces.begin(), g_stale_window_surfaces.end(), surface),
         g_stale_window_surfaces.end());
     if (g_live_window_surface != surface) {
-        LOG_W_FORCE("window surface: %p is now the surface this library presents from", surface);
     }
     g_live_window_surface = surface;
 }
@@ -156,7 +155,6 @@ void RecordCurrentWindowSurface(EGLSurface surface) {
     if (!IsLiveOrStale(surface)) return;  // not ours; leave the slot alone
     if (surface == g_live_window_surface) return;
     g_live_window_surface = surface;
-    LOG_W_FORCE("window surface: the application bound %p, so that is what this library presents from", surface);
 }
 
 // Translate a dead handle onto the live surface. Anything else is returned as-is.
@@ -256,9 +254,6 @@ static EGLSurface RetryWindowSurfaceAfterReleasingOld(EGLDisplay dpy, EGLConfig 
     }
     if (old_surface == EGL_NO_SURFACE) return EGL_NO_SURFACE;
 
-    LOG_W_FORCE("eglCreateWindowSurface: failed, and window surface %p is still attached to the native window — "
-                "releasing it (as MobileGL does before creating) and trying once",
-                old_surface);
 
     LOAD_EGL(eglCreateWindowSurface)
     if (!egl_eglCreateWindowSurface) return EGL_NO_SURFACE;
@@ -267,7 +262,6 @@ static EGLSurface RetryWindowSurfaceAfterReleasingOld(EGLDisplay dpy, EGLConfig 
     ForgetWindowSurface(old_surface);
 
     EGLSurface retry = egl_eglCreateWindowSurface(dpy, config, win, attrib_list);
-    LOG_W_FORCE("eglCreateWindowSurface: retry after releasing the old surface -> %p", retry);
     return retry;
 }
 
@@ -318,13 +312,8 @@ EGLBoolean mg_egl_present(EGLDisplay dpy, EGLSurface surface) {
     LOAD_EGL(eglSwapBuffers)
     if (!egl_eglSwapBuffers) return EGL_FALSE;
 
-    const unsigned long n = g_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    const EGLBoolean ok = egl_eglSwapBuffers(dpy, surface);
-    if (n <= 3 || (n % 600) == 0) {
-        LOG_W_FORCE("present (MobileGL DirectGLES): #%lu eglSwapBuffers(dpy=%p, surface=%p) -> %d", n, dpy, surface,
-                    static_cast<int>(ok));
-    }
-    return ok;
+    g_present_count.fetch_add(1, std::memory_order_relaxed);
+    return egl_eglSwapBuffers(dpy, surface);
 }
 
 
@@ -348,8 +337,6 @@ void mg_egl_note_window_surface(EGLDisplay dpy, EGLConfig config, EGLSurface sur
     g_target.read_surface = surface;
     g_target.have_surface = true;
     g_target_generation.fetch_add(1, std::memory_order_acq_rel);
-    LOG_W_FORCE("eglCreateWindowSurface: the application's window surface is now %p (config %p)%s", surface, config,
-                replaced ? " — replacing a previously recorded surface" : "");
 }
 
 void mg_egl_note_make_current(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx, EGLBoolean ok) {
@@ -360,8 +347,6 @@ void mg_egl_note_make_current(EGLDisplay dpy, EGLSurface draw, EGLSurface read, 
     // record beyond the fact, but it is logged — a release on the render thread
     // is what leaves it with no context and starts this whole search.
     if (ctx == EGL_NO_CONTEXT) {
-        LOG_W_FORCE("eglMakeCurrent: the application released its context on pthread=%lu",
-                    (unsigned long)pthread_self());
         return;
     }
 
@@ -394,13 +379,9 @@ void mg_egl_note_make_current(EGLDisplay dpy, EGLSurface draw, EGLSurface read, 
 
     if (ctx_changed || surf_changed) {
         g_target_generation.fetch_add(1, std::memory_order_acq_rel);
-        LOG_W_FORCE("eglMakeCurrent: the application's live binding is now surface=%p ctx=%p (pthread=%lu)",
-                    draw, ctx, (unsigned long)pthread_self());
     }
 
     if (draw == EGL_NO_SURFACE) {
-        LOG_W_FORCE("eglMakeCurrent: the application bound a context with NO SURFACE — it cannot present. "
-                    "Drawing will go nowhere unless a surface is bound later.");
     }
 }
 
@@ -424,9 +405,6 @@ void mg_egl_note_destroy_surface(EGLDisplay dpy, EGLSurface surface) {
     if (!matched) return;
 
     g_target_generation.fetch_add(1, std::memory_order_acq_rel);
-    LOG_W_FORCE("eglDestroySurface: the application destroyed surface %p, which was the recorded render target — "
-                "forgotten it, so the next bind will not fail with EGL_BAD_SURFACE",
-                surface);
 }
 
 void mg_egl_forget_surface(EGLSurface surface) {
@@ -449,7 +427,6 @@ void mg_egl_forget_surface(EGLSurface surface) {
     if (!matched) return;
 
     g_target_generation.fetch_add(1, std::memory_order_acq_rel);
-    LOG_W_FORCE("forgot surface %p after the driver rejected it — it will not be used again", surface);
 }
 
 // The present fallback was removed, so every swap reaching this function now
@@ -480,18 +457,11 @@ void mg_egl_note_swap(EGLDisplay dpy, EGLSurface surface, EGLBoolean ok) {
             g_target.have_surface = true;
         }
         g_target_generation.fetch_add(1, std::memory_order_acq_rel);
-        LOG_W_FORCE("eglSwapBuffers: this is the surface %s presents from: %p, presented by "
-                    "pthread=%lu%s",
-                    "the application", surface,
-                    (unsigned long)pthread_self(), first ? "" : " (changed from the previous one)");
     } else if (g_target.presenting_thread != 0 && !pthread_equal(g_target.presenting_thread, pthread_self())) {
         // Worth reporting: if the presenting thread moves, the render thread
         // inferred from the first swap is no longer the one that matters.
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true)) {
-            LOG_W_FORCE("eglSwapBuffers: surface %p is being presented from pthread=%lu, but the first swap was "
-                        "made by pthread=%lu",
-                        surface, (unsigned long)pthread_self(), (unsigned long)g_target.presenting_thread);
         }
     }
 }
@@ -527,7 +497,6 @@ extern "C"
         return egl_eglGetError();
     }
     EGL_API EGLDisplay eglGetDisplay(EGLNativeDisplayType display_id) {
-        LOG_W_FORCE("EGL-TRACE: eglGetDisplay called");
         mg_egl_note_call();
         LOG_D("eglGetDisplay, display_id: %p", display_id);
         LOAD_EGL(eglGetDisplay)
@@ -535,7 +504,6 @@ extern "C"
     }
 
     EGL_API EGLBoolean eglInitialize(EGLDisplay dpy, EGLint* major, EGLint* minor) {
-        LOG_W_FORCE("EGL-TRACE: eglInitialize called (dpy=%p)", (void*)dpy);
         mg_egl_note_call();
         LOG_D("eglInitialize, dpy: %p, major: %p, minor: %p", dpy, major, minor);
         LOAD_EGL(eglInitialize)
@@ -562,10 +530,7 @@ extern "C"
         // dumping all of it buried everything printed around it.
         if (result) {
             const size_t len = strlen(result);
-            LOG_W_FORCE("eglQueryString(dpy=%p, name=%d) -> %zu bytes: %.120s%s", dpy, name, len, result,
-                        len > 120 ? "..." : "");
         } else {
-            LOG_W_FORCE("eglQueryString(dpy=%p, name=%d) -> (null)", dpy, name);
         }
         return result;
     }
@@ -580,7 +545,6 @@ extern "C"
 
     EGL_API EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint* attrib_list, EGLConfig* configs,
                                        EGLint config_size, EGLint* num_config) {
-        LOG_W_FORCE("EGL-TRACE: eglChooseConfig called (dpy=%p)", (void*)dpy);
         mg_egl_note_call();
         LOG_D("eglChooseConfig, dpy: %p, attrib_list: %p, configs: %p, config_size: "
               "%d, num_config: %p",
@@ -614,7 +578,6 @@ extern "C"
         mg_egl_note_window_surface(dpy, config, surf);
         RecordWindowSurface(dpy, surf);
         mg_egl_activate_window_surface(dpy, surf);
-        LOG_W_FORCE("eglCreateWindowSurface: the application's window surface is now %p", surf);
         return surf;
     }
 
@@ -640,7 +603,6 @@ extern "C"
             // EGL 1.4 host: fall back to the classic entry point rather than
             // returning EGL_NO_SURFACE, which the application would read as a
             // hard failure.
-            LOG_W_FORCE("eglCreatePlatformWindowSurface: unavailable, using eglCreateWindowSurface");
             return eglCreateWindowSurface(dpy, config,
                                           reinterpret_cast<EGLNativeWindowType>(native_window), nullptr);
         }
@@ -651,7 +613,6 @@ extern "C"
         mg_egl_note_window_surface(dpy, config, surf);
         RecordWindowSurface(dpy, surf);
         mg_egl_activate_window_surface(dpy, surf);
-        LOG_W_FORCE("eglCreatePlatformWindowSurface: the application's window surface is now %p", surf);
         return surf;
     }
 
@@ -687,7 +648,7 @@ extern "C"
         LOAD_EGL(eglDestroySurface)
         const EGLBoolean ok = egl_eglDestroySurface(dpy, surface);
         if (ok == EGL_TRUE) {
-            if (known) LOG_W_FORCE("eglDestroySurface(%p): window surface destroyed", surface);
+
             mg_egl_note_destroy_surface(dpy, surface);
         }
         return ok;
@@ -760,7 +721,6 @@ extern "C"
     }
 
     EGL_API EGLBoolean eglSwapInterval(EGLDisplay dpy, EGLint interval) {
-        LOG_W_FORCE("EGL-TRACE: eglSwapInterval called (dpy=%p)", (void*)dpy);
         mg_egl_note_call();
         LOG_D("eglSwapInterval, dpy: %p, interval: %d", dpy, interval);
         LOAD_EGL(eglSwapInterval)
@@ -769,7 +729,6 @@ extern "C"
 
     EGL_API EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_context,
                                         const EGLint* attrib_list) {
-        LOG_W_FORCE("EGL-TRACE: eglCreateContext called (dpy=%p)", (void*)dpy);
         mg_egl_note_call();
         LOG_D("eglCreateContext, dpy: %p, config: %p, share_context: %p, "
               "attrib_list: %p",
@@ -864,17 +823,6 @@ extern "C"
 
     EGL_API EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         mg_egl_note_call();
-        // Forced, rate-limited. The whole point is to know whether the swap ever
-        // reaches this library at all, and debug logging is off in release
-        // builds — the one run where it is needed is the run where nothing else
-        // is printed.
-        {
-            static std::atomic<unsigned long> count{0};
-            const unsigned long n = count.fetch_add(1, std::memory_order_relaxed);
-            if (n < 5 || (n % 600) == 0) {
-                LOG_W_FORCE("EGL-TRACE: eglSwapBuffers #%lu dpy=%p surface=%p", n, dpy, surface);
-            }
-        }
         LOG_D("eglSwapBuffers, dpy: %p, surface: %p", dpy, surface);
         // SDL presents through the handle cached in its own window, which is a
         // surface it has already asked to destroy. Redirect it to the live one
@@ -891,7 +839,6 @@ extern "C"
         const EGLBoolean result = mg_egl_present(dpy, surface);
         if (result != EGL_TRUE) {
             LOAD_EGL(eglGetError)
-            LOG_W_FORCE("eglSwapBuffers: FAILED (0x%x) surface=%p", egl_eglGetError(), surface);
         }
         // The application presented on its own, so the present fallback has
         // nothing left to do. Turned off permanently: if a real swap chain is
@@ -915,7 +862,6 @@ extern "C"
     // swaps visible and feeds the same tracking as eglSwapBuffers.
     EGL_API EGLBoolean eglSwapBuffersWithDamageEXT(EGLDisplay dpy, EGLSurface surface, const EGLint* rects,
                                                    EGLint n_rects) {
-        LOG_W_FORCE("EGL-TRACE: eglSwapBuffersWithDamageEXT called surface=%p n_rects=%d", surface, n_rects);
         mg_egl_note_call();
         LOG_D("eglSwapBuffersWithDamageEXT, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
         surface = ResolveWindowSurface(dpy, surface);
@@ -923,14 +869,11 @@ extern "C"
         if (!egl_eglSwapBuffersWithDamageEXT) {
             // Not available: present through the one path instead of opening a
             // second one by calling back into this library's own entry point.
-            LOG_W_FORCE("eglSwapBuffersWithDamageEXT: unavailable, presenting through the single path for surface %p",
-                        surface);
             return mg_egl_present(dpy, surface);
         }
         const EGLBoolean result = mg_egl_present(dpy, surface);
         if (result != EGL_TRUE) {
             LOAD_EGL(eglGetError)
-            LOG_W_FORCE("eglSwapBuffersWithDamageEXT: FAILED (0x%x) surface=%p", egl_eglGetError(), surface);
         }
         // The application presented on its own, so the present fallback must
         // stop — same as in eglSwapBuffers. Omitting this was the direct cause
@@ -947,20 +890,16 @@ extern "C"
 
     EGL_API EGLBoolean eglSwapBuffersWithDamageKHR(EGLDisplay dpy, EGLSurface surface, const EGLint* rects,
                                                    EGLint n_rects) {
-        LOG_W_FORCE("EGL-TRACE: eglSwapBuffersWithDamageKHR called surface=%p n_rects=%d", surface, n_rects);
         mg_egl_note_call();
         LOG_D("eglSwapBuffersWithDamageKHR, dpy: %p, surface: %p, n_rects: %d", dpy, surface, n_rects);
         surface = ResolveWindowSurface(dpy, surface);
         LOAD_EGL(eglSwapBuffersWithDamageKHR)
         if (!egl_eglSwapBuffersWithDamageKHR) {
-            LOG_W_FORCE("eglSwapBuffersWithDamageKHR: unavailable, presenting through the single path for surface %p",
-                        surface);
             return mg_egl_present(dpy, surface);
         }
         const EGLBoolean result = mg_egl_present(dpy, surface);
         if (result != EGL_TRUE) {
             LOAD_EGL(eglGetError)
-            LOG_W_FORCE("eglSwapBuffersWithDamageKHR: FAILED (0x%x) surface=%p", egl_eglGetError(), surface);
         }
         // See the note in eglSwapBuffersWithDamageEXT: stopping the present
         // fallback here is what keeps two swap chains from running at once.
@@ -994,7 +933,6 @@ extern "C"
     // got the HOST driver's version instead of this library's.
     EGL_API EGLDisplay eglGetPlatformDisplayEXT(EGLenum platform, void* native_display, const EGLint* attrib_list) {
         mg_egl_note_call();
-        LOG_W_FORCE("eglGetPlatformDisplayEXT, platform: %d, native_display: %p", platform, native_display);
         LOAD_EGL(eglGetPlatformDisplayEXT)
         if (egl_eglGetPlatformDisplayEXT) {
             return egl_eglGetPlatformDisplayEXT(platform, native_display, attrib_list);
@@ -1090,19 +1028,15 @@ EGL_API EGLAPI __eglMustCastToProperFunctionPointerType EGLAPIENTRY eglGetProcAd
                         // Off: answer from the host, as this library did before
                         // the change. Every call through the returned pointer then
                         // bypasses this library entirely.
-                        LOG_W_FORCE("eglGetProcAddress(%s) -> HOST driver (procAddressOwn=0)", procname);
                         void* host = glXGetProcAddress(procname);
                         return reinterpret_cast<__eglMustCastToProperFunctionPointerType>(host);
                     }
-                    LOG_W_FORCE("eglGetProcAddress(%s) -> this library's own entry point", procname);
+
                     return reinterpret_cast<__eglMustCastToProperFunctionPointerType>(entry.address);
                 }
             }
         }
         void* host = glXGetProcAddress(procname);
-        LOG_W_FORCE("eglGetProcAddress(%s) -> %s%s", procname ? procname : "(null)",
-                    host ? "HOST driver" : "null",
-                    host ? " — calls through this pointer bypass this library" : "");
         return reinterpret_cast<__eglMustCastToProperFunctionPointerType>(host);
     }
 }

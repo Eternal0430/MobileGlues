@@ -349,13 +349,8 @@ bool TryBind(EGLDisplay dpy, EGLContext ctx, EGLSurface surf, const char* what) 
     const bool took_effect = (now_ctx == ctx) && (surf == kNoSurface || now_surf == surf);
 
     if (took_effect) {
-        LOG_W_FORCE("BindFallbackEGLContext: [%s] %s: bound (ret=%d err=0x%x surf=%p)", CurrentThreadLabel(), what,
-                    (int)ret, err, now_surf);
         return true;
     }
-    LOG_W_FORCE("BindFallbackEGLContext: [%s] %s: NOT BOUND (ret=%d err=0x%x) — wanted ctx=%p surf=%p, got ctx=%p "
-                "surf=%p",
-                CurrentThreadLabel(), what, (int)ret, err, ctx, surf, now_ctx, now_surf);
 
     // 0x300D = EGL_BAD_SURFACE: the surface is gone. Forget it so the next
     // attempt does not repeat the failure and silently draw into nothing.
@@ -423,9 +418,6 @@ bool BindFallbackEGLContextIfNeeded() {
 
         if (should_move && t_fb.bound_surface != target) {
             if (TryBind(t.display, t_fb.ctx, target, "follow the application's render target")) {
-                LOG_W_FORCE("BindFallbackEGLContext: [%s] moved onto surface %p (was %p), so drawing here reaches "
-                            "the screen",
-                            CurrentThreadLabel(), target, t_fb.bound_surface);
                 t_fb.bound_surface = target;
             } else if (t.have_binding && t.context != EGL_NO_CONTEXT) {
                 // Refused — the application's context is probably current on
@@ -438,10 +430,6 @@ bool BindFallbackEGLContextIfNeeded() {
                     t_fb.ctx = EGL_NO_CONTEXT;
                     if (CreateThreadContext(t.display, t.context, target)) {
                         if (egl_eglDestroyContext && old != eglContext) egl_eglDestroyContext(t.display, old);
-                        LOG_W_FORCE("BindFallbackEGLContext: [%s] could not rebind the application's context, so "
-                                    "this thread was given a new one on surface %p — drawing here reaches the "
-                                    "screen",
-                                    CurrentThreadLabel(), target);
                     } else {
                         t_fb.ctx = old;  // losing the context entirely is worse
                         egl_eglMakeCurrent(t.display, t_fb.bound_surface, t_fb.bound_surface, old);
@@ -457,10 +445,6 @@ bool BindFallbackEGLContextIfNeeded() {
             t_fb.ctx = EGL_NO_CONTEXT;
             if (CreateThreadContext(t.display, t.context, old_surf)) {
                 if (egl_eglDestroyContext) egl_eglDestroyContext(eglDisplay, old);
-                LOG_W_FORCE("BindFallbackEGLContext: [%s] rebuilt this thread's context to share with the "
-                            "application's context %p. It was created before that context existed, so anything "
-                            "made on it was invisible to the game",
-                            CurrentThreadLabel(), t.context);
             } else {
                 t_fb.ctx = old;  // keep what we have rather than lose the context
             }
@@ -497,15 +481,7 @@ bool BindFallbackEGLContextIfNeeded() {
 
     // Everything needed to explain a refusal, in one line. Five designs were
     // built on guesses about these values; this prints them.
-    LOG_W_FORCE("BindFallbackEGLContext: [%s] no current context. this thread: ctx=%p draw=%p dpy=%p | recorded "
-                "app: dpy=%p ctx=%p draw=%p presenting=%p | own dpy=%p",
-                CurrentThreadLabel(), egl_eglGetCurrentContext(), egl_eglGetCurrentSurface(EGL_DRAW),
-                egl_eglGetCurrentDisplay(), t.display, t.context, t.draw_surface, t.presenting_surface, eglDisplay);
     if (have_app && t.display != eglDisplay) {
-        LOG_W_FORCE("BindFallbackEGLContext: [%s] the application is on a DIFFERENT EGLDisplay (%p) than the one "
-                    "MobileGLES initialized (%p). A context may only be bound on the display it was created for, "
-                    "so bindings here are likely to be refused",
-                    CurrentThreadLabel(), t.display, eglDisplay);
     }
 
     const bool is_presenting_thread = have_presenting && t.presenting_thread != 0 &&
@@ -558,15 +534,9 @@ bool BindFallbackEGLContextIfNeeded() {
     //      thread binds it to the presenting surface.
     const EGLContext share = have_app ? t.context : EGL_NO_CONTEXT;
     if (can_use_presenting && CreateThreadContext(dpy, share, t.presenting_surface)) {
-        LOG_W_FORCE("BindFallbackEGLContext: [%s] gave this thread a context of its own on the presenting surface "
-                    "%p, so drawing here reaches the screen",
-                    CurrentThreadLabel(), t.presenting_surface);
         return true;
     }
     if (CreateThreadContext(dpy, share, kNoSurface)) {
-        LOG_W_FORCE("BindFallbackEGLContext: [%s] gave this thread a context of its own%s, surfaceless. It cannot "
-                    "present, but objects it creates are visible to the game",
-                    CurrentThreadLabel(), have_app ? " sharing with the application's context" : "");
         return true;
     }
 
@@ -619,9 +589,6 @@ void VerifyContextStillCurrent(unsigned long calls_on_this_thread) {
     static thread_local bool warned = false;
     if (!warned) {
         warned = true;
-        LOG_W_FORCE("staleness check: [pthread=%lu] had a context on an earlier call but has NONE now — %lu calls "
-                    "since the last check may have been discarded. Rebinding.",
-                    (unsigned long)pthread_self(), kVerifyInterval);
     }
     t_fb.tried = false;
     BindFallbackEGLContextIfNeeded();
@@ -644,32 +611,10 @@ void VerifyContextStillCurrent(unsigned long calls_on_this_thread) {
 // a compile loop that never finishes; those look identical from the outside and
 // are told apart instantly by which call dominates.
 // ---------------------------------------------------------------------------
-std::atomic<unsigned long> g_guarded_calls{0};
-std::atomic<bool> g_watchdog_started{false};
 
 
-void WatchdogLoop() {
-    unsigned long last_total = 0;
-    int tick = 0;
 
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::seconds(20));
 
-        const unsigned long now = g_guarded_calls.load(std::memory_order_relaxed);
-        const unsigned long delta = now - last_total;
-        last_total = now;
-
-        const AppRenderTarget& t = mg_egl_app_target();
-        LOG_W_FORCE("watchdog #%d: %lu guarded GL calls this period (%lu total)%s | window surface=%p "
-                    "presenting=%p presenting thread=%s",
-                    ++tick, delta, now, delta == 0 ? " — NO GL CALLS, the game is not drawing" : "",
-                    t.draw_surface, t.presenting_surface,
-                    t.have_presenting ? "known" : "unknown (eglSwapBuffers has never run)");
-        LOG_W_FORCE("watchdog #%d: the application bound its context on pthread=%lu%s", tick,
-                    (unsigned long)t.binding_thread,
-                    t.presenting_thread ? "" : " (eglSwapBuffers has never run, so no presenting thread is known)");
-    }
-}
 
 }  // namespace
 
@@ -722,9 +667,6 @@ void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface) {
             t_fb.ctx = t.context;
             t_fb.bound_surface = surface;
             t_fb.using_app_context = true;
-            LOG_W_FORCE("window surface %p bound to the application's context on pthread=%lu at creation time, so the "
-                        "swap chain is complete even if SDL never calls eglMakeCurrent for it",
-                        surface, (unsigned long)pthread_self());
             // STOP HERE. Falling through to case 2 was a regression: it called
             // CreateThreadContext for the SAME surface already bound above, and
             // that issues another eglMakeCurrent for a surface the application's
@@ -737,9 +679,6 @@ void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface) {
             // application swapped normally.
             return;
         }
-        LOG_W_FORCE("window surface %p could not be bound to the application's context on pthread=%lu — trying the "
-                    "library's own context instead",
-                    surface, (unsigned long)pthread_self());
     }
 
     // Case 2: bind this library's own context. MobileGL uses its single global
@@ -759,10 +698,6 @@ void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface) {
         if (CreateThreadContext(target_dpy, /*share=*/eglContext, surface)) {
             // CreateThreadContext sets t_fb.ctx / share_with / bound_surface.
             t_fb.using_app_context = false;  // not the app's context; may be migrated later
-            LOG_W_FORCE("window surface %p bound with a library-owned context (sharing with the startup context) on "
-                        "pthread=%lu — the surface is now a valid drawable even though the application has not bound "
-                        "its context yet (SDL window-reuse case)",
-                        surface, (unsigned long)pthread_self());
         } else {
             LOG_W_FORCE("window surface %p could not be bound: CreateThreadContext(share=eglContext, surface) failed on "
                         "pthread=%lu — the surface remains unbound and may produce a black screen",
@@ -777,9 +712,8 @@ void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface) {
 // "undefined symbol: mg_egl_note_call(char const*)" — a fault that -fsyntax-only
 // cannot catch, because each translation unit still compiles fine on its own.
 void mg_egl_note_call() {
-    if (!g_watchdog_started.exchange(true)) {
-        std::thread(WatchdogLoop).detach();
-    }
+    // Was the watchdog's start-up trigger. The watchdog is gone; the call sites
+    // remain because the declaration is shared, and this is now a no-op.
 }
 
 // Repair SDL's own bookkeeping — the fix for the black screen.
@@ -848,11 +782,6 @@ static void RepairSdlCurrentWindow() {
     if (!windows || count <= 0) return;
 
     const bool ok = make_current(windows[0], t.context);
-    LOG_W_FORCE("SDL repair: SDL_GL_GetCurrentWindow() was NULL (SDL clears it on release, and its EGL layer "
-                "ignores the return value, so refusing the release cannot prevent it) — re-stated the bind through "
-                "SDL_GL_MakeCurrent(window=%p, ctx=%p) -> %d; current window now %p%s",
-                windows[0], t.context, static_cast<int>(ok), get_window(),
-                ok ? " (gate open)" : " (still closed)");
     if (ok) g_sdl_repair_done = true;
 }
 
@@ -869,20 +798,9 @@ static void RepairSdlCurrentWindow() {
 // Accumulating per thread and publishing in batches removes the contention
 // without changing what the watchdog reports: it samples every 20 seconds, so a
 // count that lags by at most one batch is indistinguishable from an exact one.
-constexpr unsigned long kCallBatchSize = 4096;
-
 void mg_egl_note_guarded_call() {
     static thread_local unsigned long t_calls = 0;
-    static thread_local unsigned long t_published = 0;
     ++t_calls;
-
-    // Thread-local arithmetic, then one relaxed atomic per batch instead of one
-    // per call.
-    const unsigned long pending = t_calls - t_published;
-    if (pending >= kCallBatchSize) {
-        g_guarded_calls.fetch_add(pending, std::memory_order_relaxed);
-        t_published = t_calls;
-    }
     VerifyContextStillCurrent(t_calls);
 
     // The repair below is the fix for the black screen, so it has to run — but
@@ -900,17 +818,7 @@ void mg_egl_note_guarded_call() {
         }
     }
 
-    // A relaxed load first: exchange() is a write, and issuing one on every call
-    // keeps this cache line bouncing between cores for the life of the process.
-    // This runs once per guarded GL call — all of them, on every thread. After
-    // the first call the load is true and the exchange is never reached again.
-    if (!g_watchdog_started.load(std::memory_order_relaxed)) {
-        if (!g_watchdog_started.exchange(true, std::memory_order_relaxed)) {
-            // Detached and deliberately never joined: it outlives the GL session
-            // and costs one wake-up every 20 seconds.
-            std::thread(WatchdogLoop).detach();
-        }
-    }
+
 }
 
 // Pairs a successful BindFallbackEGLContextIfNeeded().
@@ -953,28 +861,20 @@ __attribute__((constructor)) void MobileGluesPromoteSelfToGlobalScope() {
     // init_settings() parses the same file again shortly after.
     config_refresh();
     if (config_has_key("selfPromotion") && config_get_int(const_cast<char*>("selfPromotion")) == 0) {
-        LOG_W_FORCE("self-promotion: disabled by config (selfPromotion=0) — dlsym(RTLD_DEFAULT, ...) will keep "
-                    "resolving to the host driver");
         return;
     }
 
     Dl_info info;
     if (dladdr(reinterpret_cast<void*>(&MobileGluesPromoteSelfToGlobalScope), &info) == 0 || !info.dli_fname) {
-        LOG_W_FORCE("self-promotion: could not determine this library's own path");
         return;
     }
     void* self = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_GLOBAL);
     if (!self) {
-        LOG_W_FORCE("self-promotion: dlopen(%s, RTLD_NOLOAD|RTLD_GLOBAL) failed", info.dli_fname);
         return;
     }
 
     void* ours = dlsym(self, "eglSwapBuffers");
     void* via_default = dlsym(RTLD_DEFAULT, "eglSwapBuffers");
-    LOG_W_FORCE("self-promotion: this library is in the global symbol scope now. eglSwapBuffers: ours=%p "
-                "dlsym(RTLD_DEFAULT)=%p -> %s",
-                ours, via_default,
-                (ours != nullptr && ours == via_default) ? "RESOLVES TO THIS LIBRARY" : "still resolves elsewhere");
 }
 
 }  // namespace
