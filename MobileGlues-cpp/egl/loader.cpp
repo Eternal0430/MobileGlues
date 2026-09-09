@@ -241,6 +241,38 @@ const char* CurrentThreadLabel() {
     return label;
 }
 
+// The config a surface was created with, so a context made for it is compatible.
+//
+// g_context_config is chosen in init_target_egl() with EGL_SURFACE_TYPE =
+// EGL_PBUFFER_BIT and EGL_RENDERABLE_TYPE = EGL_OPENGL_ES2_BIT, because it only
+// ever has to back the startup pbuffer. Creating a context on it and binding
+// that to a window surface the application made is asking for EGL_BAD_MATCH:
+// EGL requires the context's config and the surface's config to be compatible,
+// and a pbuffer-only ES2 config is not compatible with a window surface.
+//
+// That is why "CreateThreadContext ... failed" was not occasional but certain,
+// and a failed eglMakeCurrent on this driver does not leave the previous
+// binding alone -- it disturbs the draw binding, which is what pushed rendering
+// off the window surface and onto a fallback path.
+//
+// Asking the surface which config it is is the only correct answer, so try that
+// first and fall back to the startup config only when the query is unavailable.
+static bool ConfigForSurface(EGLDisplay dpy, EGLSurface surf, EGLConfig* out) {
+    LOAD_EGL(eglQuerySurface);
+    LOAD_EGL(eglChooseConfig);
+    if (!egl_eglQuerySurface || !egl_eglChooseConfig || surf == EGL_NO_SURFACE) return false;
+
+    EGLint config_id = 0;
+    if (egl_eglQuerySurface(dpy, surf, EGL_CONFIG_ID, &config_id) != EGL_TRUE) return false;
+
+    const EGLint attribs[] = {EGL_CONFIG_ID, config_id, EGL_NONE};
+    EGLConfig cfg = nullptr;
+    EGLint found = 0;
+    if (egl_eglChooseConfig(dpy, attribs, &cfg, 1, &found) != EGL_TRUE || found == 0) return false;
+    *out = cfg;
+    return true;
+}
+
 // Creates a context for this thread and binds it to `surf` (EGL_NO_SURFACE for
 // surfaceless).
 bool CreateThreadContext(EGLDisplay dpy, EGLContext share, EGLSurface surf) {
@@ -249,6 +281,14 @@ bool CreateThreadContext(EGLDisplay dpy, EGLContext share, EGLSurface surf) {
     LOAD_EGL(eglMakeCurrent);
     LOAD_EGL(eglGetError);
     if (!egl_eglCreateContext || !g_context_config_valid) return false;
+
+    // Prefer the config the surface was actually created with; only a context on
+    // a compatible config can be bound to it.
+    EGLConfig config = g_context_config;
+    if (surf != EGL_NO_SURFACE) {
+        EGLConfig surface_config = nullptr;
+        if (ConfigForSurface(dpy, surf, &surface_config)) config = surface_config;
+    }
 
     // Sharing requires the driver to consider the two contexts compatible, and
     // the application's may be a later ES version than ours. Try the newest
@@ -259,7 +299,7 @@ bool CreateThreadContext(EGLDisplay dpy, EGLContext share, EGLSurface surf) {
     const EGLint* candidates[] = {attrs_v3, attrs_v2, attrs_none};
 
     for (const EGLint* attrs : candidates) {
-        EGLContext ctx = egl_eglCreateContext(dpy, g_context_config, share, attrs);
+        EGLContext ctx = egl_eglCreateContext(dpy, config, share, attrs);
         if (ctx == EGL_NO_CONTEXT) continue;
         if (egl_eglMakeCurrent(dpy, surf, surf, ctx) != EGL_TRUE) {
             egl_eglGetError();
@@ -860,10 +900,16 @@ void mg_egl_note_guarded_call() {
         }
     }
 
-    if (!g_watchdog_started.exchange(true)) {
-        // Detached and deliberately never joined: it outlives the GL session and
-        // costs one wake-up every 20 seconds.
-        std::thread(WatchdogLoop).detach();
+    // A relaxed load first: exchange() is a write, and issuing one on every call
+    // keeps this cache line bouncing between cores for the life of the process.
+    // This runs once per guarded GL call — all of them, on every thread. After
+    // the first call the load is true and the exchange is never reached again.
+    if (!g_watchdog_started.load(std::memory_order_relaxed)) {
+        if (!g_watchdog_started.exchange(true, std::memory_order_relaxed)) {
+            // Detached and deliberately never joined: it outlives the GL session
+            // and costs one wake-up every 20 seconds.
+            std::thread(WatchdogLoop).detach();
+        }
     }
 }
 
