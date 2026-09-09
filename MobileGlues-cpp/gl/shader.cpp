@@ -31,6 +31,7 @@
 #include "../includes.h"
 #include "glsl/glsl_for_es.h"
 #include "log.h"
+#include "../egl/loader.h"
 #include "../gles/loader.h"
 #include "mg.h"
 #include "GL/gl.h"
@@ -208,6 +209,7 @@ static GLenum detect_shader_type_from_source(const ShaderSourceInfo& info) {
 // Also caches the shader type to avoid glGetShaderiv GPU round-trip later.
 // ---------------------------------------------------------------------------
 GLuint glCreateShader(GLenum type) {
+    ScopedHostContext __hostCtx;
     GLuint shader = GLES.glCreateShader(type);
     if (shader != 0) {
         auto& cacheEntry = get_shader_cache(shader);
@@ -230,6 +232,7 @@ GLuint glCreateShader(GLenum type) {
 // Logs compilation errors to help diagnose shader pack issues.
 // ---------------------------------------------------------------------------
 void glCompileShader(GLuint shader) {
+    ScopedHostContext __hostCtx;
     GLES.glCompileShader(shader);
     GLint compiled = 0;
     GLES.glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
@@ -271,6 +274,7 @@ void glCompileShader(GLuint shader) {
 // ============================================================================
 
 void glShaderSource(GLuint shader, GLsizei count, const GLchar* const* string, const GLint* length) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glShaderSource hook, shader=%d, count=%d", shader, count)
 

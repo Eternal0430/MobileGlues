@@ -12,6 +12,13 @@
 #include "buffer.h"
 #include "ankerl/unordered_dense.h"
 #include "texture.h"
+// ScopedHostContext: binds the fallback pbuffer context when the calling
+// thread has none (host buffer calls are silently dropped otherwise).
+#include "../egl/loader.h"
+
+// Used by the CPU shadow mapping fallback (atomic + mutex).
+#include <atomic>
+#include <mutex>
 
 #define DEBUG 0
 
@@ -522,6 +529,7 @@ void glGenBuffers(GLsizei n, GLuint* buffers) {
 }
 
 void glDeleteBuffers(GLsizei n, const GLuint* buffers) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glDeleteBuffers(%i, %p)", n, buffers)
     for (int i = 0; i < n; ++i) {
@@ -547,6 +555,7 @@ GLboolean glIsBuffer(GLuint buffer) {
 // ============================================================================
 
 void glBindBuffer(GLenum target, GLuint buffer) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glBindBuffer, target = %s, buffer = %d", glEnumToString(target), buffer)
     set_bound_buffer_by_target(target, buffer);
@@ -584,6 +593,7 @@ void glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage
     LOG()
     LOG_D("glBufferData, target = %s, size = %d, data = 0x%x, usage = %s", glEnumToString(target), size, data,
           glEnumToString(usage))
+    ScopedHostContext hostCtx;
     GLES.glBufferData(target, size, data, usage);
     int idx = binding_target_to_index(target);
     if (idx >= 0) {
@@ -600,6 +610,7 @@ void glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage
 void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data) {
     LOG()
     LOG_D("glBufferSubData, target = %s, offset = %d, size = %d, data = %p", glEnumToString(target), offset, size, data)
+    ScopedHostContext hostCtx;
     GLES.glBufferSubData(target, offset, size, data);
     // Sync PBO shadow for GL_PIXEL_UNPACK_BUFFER. target is known at this
     // point so index g_bound_buffers_arr directly (skip the switch).
@@ -616,6 +627,7 @@ void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void
 void* glMapBuffer(GLenum target, GLenum access) {
     LOG()
     LOG_D("glMapBuffer, target = %s, access = %s", glEnumToString(target), glEnumToString(access))
+    ScopedHostContext hostCtx;
     if (g_gles_caps.GL_OES_mapbuffer) {
         return GLES.glMapBufferOES(target, access);
     }
@@ -635,8 +647,192 @@ void* glMapBuffer(GLenum target, GLenum access) {
     return ptr;
 }
 
+// ============================================================================
+// Persistent-mapping flag repair
+// ============================================================================
+namespace {
+
+// GL_MAP_UNSYNCHRONIZED_BIT asks the driver not to wait for pending work on the
+// buffer; GL_MAP_PERSISTENT_BIT asks it to keep the pointer valid while the GPU
+// keeps using that buffer. Asking for both at once is self-contradictory.
+//
+// Minecraft 26.3 does exactly that. GlBuffer.Direct builds its mapping flags as
+//   34  = GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT    (writable buffer)
+// | 192 = GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT     (immutable buffer)
+// = 226 (0xE2), and maps a buffer whose storage flags are
+//   194 = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT.
+// The core spec's error list does not name this combination, but Adreno and
+// turnip reject it: glMapBufferRange returns NULL and the game dies with
+// "IllegalStateException: Failed to map buffer" in
+// GlBuffer$Direct.map during RenderSystem.initRenderer.
+//
+// INVALIDATE_* is dropped alongside it: discarding the contents of a mapping
+// that is supposed to stay valid has the same problem.
+constexpr GLbitfield kPersistentConflictBits =
+    GL_MAP_UNSYNCHRONIZED_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT;
+
+GLenum DrainHostGLError() {
+    if (!GLES.glGetError) return GL_NO_ERROR;
+    GLenum last = GL_NO_ERROR;
+    for (;;) {
+        const GLenum e = GLES.glGetError();
+        if (e == GL_NO_ERROR) return last;
+        last = e;
+    }
+}
+
+// One attempt. Returns the pointer, or NULL with the host error in *errOut.
+void* TryMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access, GLenum* errOut) {
+    if (!GLES.glMapBufferRange) {
+        *errOut = GL_NO_ERROR;
+        return nullptr;
+    }
+    void* ptr = GLES.glMapBufferRange(target, offset, length, access);
+    if (ptr) {
+        *errOut = GL_NO_ERROR;
+        return ptr;
+    }
+    *errOut = DrainHostGLError();
+    return nullptr;
+}
+
+} // namespace
+
+// ============================================================================
+// CPU shadow mapping — last resort
+//
+//   Minecraft treats a NULL from glMapBufferRange as fatal:
+//       throw new IllegalStateException("Failed to map buffer")
+//   during RenderSystem.initRenderer, before the first frame. Whatever the
+//   driver's reason, the result is a game that never starts.
+//
+//   When every host mapping attempt has failed, hand the caller a heap
+//   allocation instead and push it to the GPU with glBufferSubData, which is
+//   core in ES 3.2 and cannot be refused the way a mapping can. The game boots
+//   and logs a loud warning; correctness is preserved by flushing the shadow
+//   before each draw (see mg_flush_shadow_mappings).
+// ============================================================================
+namespace {
+
+struct ShadowMapping {
+    void* ptr = nullptr;
+    GLintptr offset = 0;
+    GLsizeiptr length = 0;
+    GLenum target = 0;
+    bool active = false;
+};
+
+std::array<ShadowMapping, BINDING_COUNT> g_shadow_mappings;
+std::atomic<bool> g_any_shadow_active{false};
+std::mutex g_shadow_mutex;
+
+} // namespace
+
+// Uploads every active shadow mapping to its buffer. Called before drawing:
+// a persistent mapping is written by the CPU and read by the GPU without any
+// intervening unmap, so draw time is the only point where the data is known to
+// be complete. Cheap when nothing is shadowed — a single relaxed load.
+void mg_flush_shadow_mappings() {
+    if (!g_any_shadow_active.load(std::memory_order_relaxed)) return;
+    if (!GLES.glBufferSubData || !GLES.glBindBuffer) return;
+
+    // glBufferSubData into a context-less thread is dropped just as silently
+    // as the mapping was, so the shadow needs the same guarantee.
+    ScopedHostContext hostCtx;
+    std::lock_guard<std::mutex> lock(g_shadow_mutex);
+    for (ShadowMapping& s : g_shadow_mappings) {
+        if (!s.active || !s.ptr || s.length <= 0) continue;
+
+        // Resolve the driver-side name at flush time: the binding may have
+        // changed since the mapping was installed.
+        GLuint real = mg_driver_bound_buffer(s.target);
+        if (real == 0) real = find_real_buffer(find_bound_buffer(get_binding_query(s.target)));
+        if (real == 0) continue;
+
+        GLint previous = 0;
+        if (GLES.glGetIntegerv) GLES.glGetIntegerv(get_binding_query(s.target), &previous);
+        if ((GLuint)previous != real) GLES.glBindBuffer(s.target, real);
+        GLES.glBufferSubData(s.target, s.offset, s.length, s.ptr);
+        if ((GLuint)previous != real) GLES.glBindBuffer(s.target, (GLuint)previous);
+    }
+}
+
+namespace {
+
+// Installs a shadow mapping for a failed write mapping. Returns false if this
+// case cannot be shadowed (a read mapping has no CPU-side source of data).
+bool InstallShadowMapping(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access, void** out) {
+    if (!(access & GL_MAP_WRITE_BIT) || length <= 0) return false;
+
+    const int idx = binding_target_to_index(target);
+    if (idx < 0) return false;
+
+    void* ptr = calloc(1, (size_t)length);
+    if (!ptr) return false;
+
+    std::lock_guard<std::mutex> lock(g_shadow_mutex);
+    ShadowMapping& s = g_shadow_mappings[idx];
+    if (s.active) {
+        // Already shadowed and never unmapped; reuse rather than leak.
+        free(ptr);
+        *out = s.ptr;
+        return true;
+    }
+
+    s.ptr = ptr;
+    s.offset = offset;
+    s.length = length;
+    s.target = target;
+    s.active = true;
+    g_any_shadow_active.store(true, std::memory_order_relaxed);
+    *out = ptr;
+    return true;
+}
+
+// Uploads and releases the shadow mapping for `target`. Returns true if one was
+// installed, in which case the host glUnmapBuffer must not be called.
+bool ReleaseShadowMapping(GLenum target) {
+    const int idx = binding_target_to_index(target);
+    if (idx < 0) return false;
+
+    std::lock_guard<std::mutex> lock(g_shadow_mutex);
+    ShadowMapping& s = g_shadow_mappings[idx];
+    if (!s.active) return false;
+
+    ScopedHostContext hostCtx;
+    if (s.ptr && s.length > 0 && GLES.glBufferSubData && GLES.glBindBuffer) {
+        GLuint real = mg_driver_bound_buffer(s.target);
+        if (real == 0) real = find_real_buffer(find_bound_buffer(get_binding_query(s.target)));
+        if (real != 0) {
+            GLint previous = 0;
+            if (GLES.glGetIntegerv) GLES.glGetIntegerv(get_binding_query(s.target), &previous);
+            if ((GLuint)previous != real) GLES.glBindBuffer(s.target, real);
+            GLES.glBufferSubData(s.target, s.offset, s.length, s.ptr);
+            if ((GLuint)previous != real) GLES.glBindBuffer(s.target, (GLuint)previous);
+        }
+    }
+
+    free(s.ptr);
+    s = ShadowMapping{};
+    g_any_shadow_active.store(false, std::memory_order_relaxed);
+    for (const ShadowMapping& other : g_shadow_mappings) {
+        if (other.active) g_any_shadow_active.store(true, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+} // namespace
+
 void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
     LOG()
+    // The host returns NULL from glMapBufferRange when the calling thread has
+    // no current EGL context, and Minecraft turns that NULL into a fatal
+    // "Failed to map buffer". This thread has been observed to lack a context:
+    // the same RenderSystem.initRenderer sequence produced a NULL glGetString
+    // (crash 1) and a zeroed glGetIntegerv (crash 2), both of which this
+    // wrapper fixed. The scope covers every attempt below plus the shadow
+    // install, so all of them see one consistent context.
+    ScopedHostContext hostCtx;
     if (global_settings.buffer_coherent_as_flush) access &= ~GL_MAP_FLUSH_EXPLICIT_BIT;
     // For write mappings of GL_PIXEL_UNPACK_BUFFER, return a pointer into the
     // CPU shadow buffer so that subsequent glTexSubImage2D can swizzle the
@@ -666,12 +862,64 @@ void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitf
             }
         }
     }
-    return GLES.glMapBufferRange(target, offset, length, access);
+    const GLbitfield requested = access;
+
+    // Drop whatever contradicts a persistent mapping before the first attempt.
+    if (access & GL_MAP_PERSISTENT_BIT) access &= ~kPersistentConflictBits;
+
+    GLenum err = GL_NO_ERROR;
+    void* ptr = TryMapBufferRange(target, offset, length, access, &err);
+    if (ptr) return ptr;
+
+    // Nothing. Minecraft turns the NULL into "IllegalStateException: Failed to
+    // map buffer", so leave everything needed to identify the rejected
+    // restriction in latest.log — including the GL error code, which the
+    // CHECK_GL_ERROR macro discards in release builds.
+    LOG_W_FORCE("glMapBufferRange failed: target=%s(0x%x) offset=%lld length=%lld requested=0x%x tried=0x%x "
+                "glError=0x%x",
+                glEnumToString(target), target, (long long)offset, (long long)length, requested, access, err);
+
+    // Retry without the persistence bits: if this buffer never actually got
+    // immutable persistent storage (a driver that refused the flags, or a build
+    // without GL_EXT_buffer_storage), persistence is what is being rejected.
+    if (access & (GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT)) {
+        const GLbitfield plain = access & ~(GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT | kPersistentConflictBits);
+        if (plain != access) {
+            ptr = TryMapBufferRange(target, offset, length, plain, &err);
+            if (ptr) {
+                LOG_W_FORCE("glMapBufferRange succeeded on retry without PERSISTENT/COHERENT "
+                            "(tried=0x%x); the buffer has no persistent storage",
+                            plain);
+                return ptr;
+            }
+            LOG_W_FORCE("glMapBufferRange retry without PERSISTENT/COHERENT also failed (tried=0x%x glError=0x%x)",
+                        plain, err);
+        }
+    }
+
+    // Every host attempt refused. Rather than hand the game a NULL that it
+    // turns into a fatal exception, back the mapping with heap memory and push
+    // it to the GPU with glBufferSubData.
+    void* shadow = nullptr;
+    if (InstallShadowMapping(target, offset, length, requested, &shadow)) {
+        static bool warned_once = false;
+        if (!warned_once) {
+            warned_once = true;
+            LOG_W_FORCE("glMapBufferRange fell back to a CPU shadow for %s(0x%x) offset=%lld length=%lld "
+                        "requested=0x%x — the host driver refused every mapping. The game will run, but "
+                        "uploads are slower; see the persistent map probe lines above for the cause.",
+                        glEnumToString(target), target, (long long)offset, (long long)length, requested);
+        }
+        return shadow;
+    }
+
+    return nullptr;
 }
 
 GLboolean glUnmapBuffer(GLenum target) {
     LOG()
     LOG_D("%s(%s)", __func__, glEnumToString(target));
+    ScopedHostContext hostCtx;
     // For PBO write mappings, we returned a pointer into the CPU shadow.
     // Now sync only the dirty mapped region to the GLES buffer via
     // glBufferSubData (which is always supported, unlike
@@ -705,6 +953,11 @@ GLboolean glUnmapBuffer(GLenum target) {
     }
     if (g_gles_caps.GL_OES_mapbuffer) return GLES.glUnmapBuffer(target);
 
+    // A CPU shadow was installed because every mapping attempt failed: upload
+    // it and report success. Calling the host glUnmapBuffer here would be wrong
+    // — nothing is mapped as far as the driver is concerned.
+    if (ReleaseShadowMapping(target)) return GL_TRUE;
+
     GLboolean result = GLES.glUnmapBuffer(target);
     CHECK_GL_ERROR
     return result;
@@ -712,6 +965,7 @@ GLboolean glUnmapBuffer(GLenum target) {
 
 void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
     LOG()
+    ScopedHostContext hostCtx;
     if (!global_settings.buffer_coherent_as_flush) GLES.glFlushMappedBufferRange(target, offset, length);
 }
 
@@ -755,6 +1009,7 @@ void bindAllAtomicCounterAsSSBO() {
 }
 
 void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glBindBufferRange, target = %s, index = %d, buffer = %d, offset = %p, size = %zi", glEnumToString(target),
           index, buffer, (void*)offset, size)
@@ -800,6 +1055,7 @@ void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offs
 }
 
 void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glBindBufferBase, target = %s, index = %d, buffer = %d", glEnumToString(target), index, buffer)
 
@@ -833,6 +1089,7 @@ void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
 // ============================================================================
 
 void glBindVertexBuffer(GLuint bindingindex, GLuint buffer, GLintptr offset, GLsizei stride) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glBindVertexBuffer, bindingindex = %d, buffer = %d, offset = %p, stride = %i", bindingindex, buffer, offset,
           stride)
@@ -861,6 +1118,7 @@ void glBindVertexBuffer(GLuint bindingindex, GLuint buffer, GLintptr offset, GLs
 // ============================================================================
 
 void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glCopyBufferSubData, readTarget = %s, writeTarget = %s, readOffset = %d, writeOffset = %d, size = %d",
           glEnumToString(readTarget), glEnumToString(writeTarget), readOffset, writeOffset, size)
@@ -873,6 +1131,7 @@ void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOff
 // ============================================================================
 
 void glGetBufferParameteriv(GLenum target, GLenum pname, GLint* params) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glGetBufferParameteriv, target = %s, pname = %s", glEnumToString(target), glEnumToString(pname))
     GLES.glGetBufferParameteriv(target, pname, params);
@@ -880,6 +1139,7 @@ void glGetBufferParameteriv(GLenum target, GLenum pname, GLint* params) {
 }
 
 void glGetBufferParameteri64v(GLenum target, GLenum pname, GLint64* params) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glGetBufferParameteri64v, target = %s, pname = %s", glEnumToString(target), glEnumToString(pname))
     GLES.glGetBufferParameteri64v(target, pname, params);
@@ -887,6 +1147,7 @@ void glGetBufferParameteri64v(GLenum target, GLenum pname, GLint64* params) {
 }
 
 void glGetBufferPointerv(GLenum target, GLenum pname, void** params) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glGetBufferPointerv, target = %s, pname = %s", glEnumToString(target), glEnumToString(pname))
     GLES.glGetBufferPointerv(target, pname, params);
@@ -899,11 +1160,79 @@ void glGetBufferPointerv(GLenum target, GLenum pname, void** params) {
 
 void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfield flags) {
     LOG()
+    // Host buffer calls are silently discarded when the calling thread has no
+    // current EGL context — no storage is allocated and no GL error is raised —
+    // so the allocation and the later mapping must both run under a context.
+    // See glMapBufferRange for why this thread may not have one.
+    ScopedHostContext hostCtx;
     if (GLES.glBufferStorageEXT) {
+        // A flags word that says "mappable" or "updatable" without naming a
+        // direction is rejected outright by this host
+        // (GL_ARRAY_BUFFER, 256 KB, flags=0x100 = DYNAMIC_STORAGE alone,
+        // glError=0x502 GL_INVALID_OPERATION). The allocation then does not
+        // happen, the buffer is left with no storage, and a later
+        // glMapBufferRange returns NULL — measured on this device.
+        //
+        // That is what made terrain "roll back": Minecraft/Sodium allocates its
+        // chunk vertex buffer this way, so while moving through the world every
+        // upload silently failed and the renderer kept drawing the previous
+        // frame's geometry. The main menu allocates no chunk buffers, which is
+        // why it looked fine.
+        //
+        // buffer_coherent_as_flush=1 used to paper over this by OR-ing in
+        // WRITE|COHERENT|PERSISTENT. Turning it off exposed the rejection. Add
+        // only a direction bit here: COHERENT is deliberately NOT added, so the
+        // application's own glFlushMappedBufferRange remains the ordering
+        // signal, which is the whole point of that setting being 0.
+        const GLbitfield map_direction = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT;
+        const GLbitfield needs_direction =
+            GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT | GL_MAP_FLUSH_EXPLICIT_BIT | GL_DYNAMIC_STORAGE_BIT;
+        if ((flags & needs_direction) != 0 && (flags & map_direction) == 0) {
+            flags |= GL_MAP_WRITE_BIT;
+        }
+
         if (global_settings.buffer_coherent_as_flush &&
             ((flags & GL_MAP_PERSISTENT_BIT) != 0 || (flags & GL_DYNAMIC_STORAGE_BIT) != 0))
             flags |= (GL_MAP_WRITE_BIT | GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT);
+
+        // Clear any pending error before this call, otherwise the check below
+        // reports an error left by earlier, unrelated work and the allocation is
+        // blamed for something it did not do. This very log showed a rejection
+        // with flags=0x102 (DYNAMIC_STORAGE|WRITE), a combination the driver
+        // accepts everywhere else — the report was stale, not real.
+        if (GLES.glGetError) {
+            for (int drain = 0; drain < 8; ++drain) {
+                if (GLES.glGetError() == GL_NO_ERROR) break;
+            }
+        }
         GLES.glBufferStorageEXT(target, size, data, flags);
+
+        // CHECK_GL_ERROR compiles to nothing in release builds, so a rejected
+        // allocation would leave the buffer with no storage and leave no trace
+        // at all — the caller only finds out later, when glMapBufferRange
+        // returns NULL. Report the first rejection, and keep counting: the
+        // failure repeats on every chunk upload, and a single "warn once" line
+        // made a per-frame problem look like a one-off.
+        if (GLES.glGetError) {
+            static bool storage_warned_once = false;
+            static std::atomic<unsigned long> storage_rejections{0};
+            const GLenum err = GLES.glGetError();
+            if (err != GL_NO_ERROR) {
+                const unsigned long n = storage_rejections.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (!storage_warned_once) {
+                    storage_warned_once = true;
+                    LOG_W_FORCE("glBufferStorage was rejected: target=%s(0x%x) size=%lld flags=0x%x glError=0x%x — the "
+                                "buffer has no storage, so a later glMapBufferRange will return NULL",
+                                glEnumToString(target), target, (long long)size, flags, err);
+                }
+                if (n == 100 || n == 1000 || n == 10000) {
+                    LOG_W_FORCE("glBufferStorage has been rejected %lu times (last: target=%s flags=0x%x err=0x%x) — "
+                                "uploads to these buffers are being lost every frame",
+                                n, glEnumToString(target), flags, err);
+                }
+            }
+        }
+
         // Mirror glBufferData: keep the PBO CPU shadow in sync so the BGRA
         // swizzle in texture.cpp can read from CPU memory instead of mapping
         // the (immutable, possibly non-DYNAMIC_STORAGE) GLES buffer for read.
@@ -917,6 +1246,23 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
                 pbo_shadow_alloc(g_bound_buffers_arr[idx], size, data);
             }
         }
+    } else {
+        // No glBufferStorageEXT. Doing nothing here would leave the buffer
+        // without any storage, so the next glMapBufferRange returns NULL and
+        // the caller reports only "Failed to map buffer" — with no GL error in
+        // between, because nothing was ever sent to the driver.
+        //
+        // Allocate mutable storage instead. glMapBufferRange then drops the
+        // persistence bits on retry, since mutable storage has no storage
+        // flags to match them against.
+        static bool warned_once = false;
+        if (!warned_once) {
+            warned_once = true;
+            LOG_W_FORCE("glBufferStorage: glBufferStorageEXT is unavailable; falling back to glBufferData "
+                        "(first target=%s, size=%lld). Persistent mappings will be downgraded to plain ones.",
+                        glEnumToString(target), (long long)size);
+        }
+        glBufferData(target, size, data, (flags & GL_DYNAMIC_STORAGE_BIT) ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW);
     }
     CHECK_GL_ERROR
 }
@@ -962,6 +1308,7 @@ static inline GLuint resolve_tbo_buffer(GLuint buffer) {
 }
 
 void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glTexBuffer, target = %s, internalformat = %s, buffer = %d", glEnumToString(target),
           glEnumToString(internalformat), buffer)
@@ -974,6 +1321,7 @@ void glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer) {
 }
 
 void glTexBufferRange(GLenum target, GLenum internalformat, GLuint buffer, GLintptr offset, GLsizeiptr size) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glTexBufferRange, target = %s, internalformat = %s, buffer = %d, offset = %p, size = %zi",
           glEnumToString(target), glEnumToString(internalformat), buffer, (void*)offset, size)
@@ -998,6 +1346,7 @@ void glGenVertexArrays(GLsizei n, GLuint* arrays) {
 }
 
 void glDeleteVertexArrays(GLsizei n, const GLuint* arrays) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glDeleteVertexArrays(%i, %p)", n, arrays)
     for (int i = 0; i < n; ++i) {
@@ -1019,6 +1368,7 @@ GLboolean glIsVertexArray(GLuint array) {
 }
 
 void glBindVertexArray(GLuint array) {
+    ScopedHostContext __hostCtx;
     LOG()
     LOG_D("glBindVertexArray(%d)", array)
 

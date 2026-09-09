@@ -13,6 +13,7 @@
 #include <GL/gl.h>
 #include "glcorearb.h"
 #include "log.h"
+#include "../egl/loader.h"
 #include "../gles/loader.h"
 #include "mg.h"
 #include <GLES3/gl32.h>
@@ -97,41 +98,57 @@ static inline __attribute__((always_inline)) void readbackAtomicCounters() {
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+    ScopedHostContext __hostCtx;
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawArrays(mode, first, count);
 }
 
 extern "C" GLAPI GLAPIENTRY void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
+    ScopedHostContext __hostCtx;
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawElements(mode, count, type, indices);
 }
 
 extern "C" GLAPI GLAPIENTRY void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
+    ScopedHostContext __hostCtx;
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawArraysInstanced(mode, first, count, instancecount);
 }
 
 extern "C" GLAPI GLAPIENTRY void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount) {
+    ScopedHostContext __hostCtx;
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawElementsInstanced(mode, count, type, indices, instancecount);
 }
 
 extern "C" GLAPI GLAPIENTRY void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices) {
+    ScopedHostContext __hostCtx;
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawRangeElements(mode, start, end, count, type, indices);
 }
 
 extern "C" GLAPI GLAPIENTRY void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const void *indices, GLint basevertex) {
+    ScopedHostContext __hostCtx;
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawElementsBaseVertex(mode, count, type, indices, basevertex);
 }
 
 extern "C" GLAPI GLAPIENTRY void glDrawArraysIndirect(GLenum mode, const void *indirect) {
+    ScopedHostContext __hostCtx;
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawArraysIndirect(mode, indirect);
 }
 
 extern "C" GLAPI GLAPIENTRY void glDrawElementsIndirect(GLenum mode, GLenum type, const void *indirect) {
+    ScopedHostContext __hostCtx;
+    mg_flush_shadow_mappings();
     syncAtomicCounters();
     GLES.glDrawElementsIndirect(mode, type, indirect);
 }
@@ -141,6 +158,7 @@ extern "C" GLAPI GLAPIENTRY void glDrawElementsIndirect(GLenum mode, GLenum type
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glDispatchCompute(GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z) {
+    ScopedHostContext __hostCtx;
     syncAtomicCounters();
     GLES.glDispatchCompute(num_groups_x, num_groups_y, num_groups_z);
     readbackAtomicCounters();
@@ -151,6 +169,7 @@ extern "C" GLAPI GLAPIENTRY void glDispatchCompute(GLuint num_groups_x, GLuint n
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glDrawBuffers(GLsizei n, const GLenum *bufs) {
+    ScopedHostContext __hostCtx;
     GLES.glDrawBuffers(n, bufs);
 
     auto &fb = GLState.framebuffer;
@@ -165,6 +184,7 @@ extern "C" GLAPI GLAPIENTRY void glDrawBuffers(GLsizei n, const GLenum *bufs) {
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glBindImageTexture(GLuint unit, GLuint texture, GLint level, GLboolean layered, GLint layer, GLenum access, GLenum format) {
+    ScopedHostContext __hostCtx;
     GLES.glBindImageTexture(unit, texture, level, layered, layer, access, format);
 
     if (unit < MAX_IMAGE_UNITS) {
@@ -202,6 +222,7 @@ extern "C" GLAPI GLAPIENTRY void glBindImageTexture(GLuint unit, GLuint texture,
                                  GL_SHADER_STORAGE_BARRIER_BIT)
 
 extern "C" GLAPI GLAPIENTRY void glMemoryBarrier(GLbitfield barriers) {
+    ScopedHostContext __hostCtx;
     if (barriers & GL_ATOMIC_COUNTER_BARRIER_BIT) {
         syncAtomicCounters();
     }

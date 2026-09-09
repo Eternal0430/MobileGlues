@@ -120,7 +120,11 @@ std::string getGPUInfo() {
     if (glesLib) {
         auto glGetString = (const GLubyte* (*)(GLenum))dlsym(glesLib, "glGetString");
         if (glGetString) {
-            renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+            // The driver may legitimately return NULL here (e.g. the pbuffer
+            // context was not bound on this thread); assigning that to a
+            // std::string is UB and crashes in strlen().
+            const char* raw = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+            if (raw) renderer = raw;
         }
         dlclose(glesLib);
     }

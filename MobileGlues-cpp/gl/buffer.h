@@ -42,6 +42,13 @@ extern "C"
 
     void set_bound_buffer_by_target(GLenum target, GLuint buffer);
 
+    // Uploads any CPU shadow mappings installed by glMapBufferRange's last
+    // resort fallback. Must be called before drawing: a persistent mapping is
+    // written by the CPU and read by the GPU without any intervening unmap, so
+    // draw time is the only point at which the data is known to be complete.
+    // Returns immediately (one relaxed atomic load) when nothing is shadowed.
+    void mg_flush_shadow_mappings();
+
     // --- PBO CPU shadow data (for BGRA swizzle without glMapBufferRange read) ---
     // MobileGL-DirectGLES keeps a CPU shadow copy of every PBO; we adopt the
     // same design but only for GL_PIXEL_UNPACK_BUFFER. This lets us do CPU-side

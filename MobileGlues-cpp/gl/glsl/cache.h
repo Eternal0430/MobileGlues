@@ -16,7 +16,11 @@
 #include <array>
 #include <string>
 #include <cstdint>
+#include <atomic>
+#include <chrono>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 class Cache {
 public:
@@ -55,20 +59,34 @@ private:
     UnorderedMap<std::array<uint8_t, 32>, ListIterator, SHA256Hash> cacheMap;
     size_t cacheSize = 0;
     bool dirty = false;
-    size_t pendingWrites = 0;  // new entries added since the last saveLocked()
 
-    // Guards cacheList, cacheMap, cacheSize, dirty, pendingWrites.
+    // When the most recent putByHash() happened, and whether a save has been
+    // scheduled. Saving is deferred until compilation goes quiet; see
+    // MaybeStartSaveThread() in cache.cpp for why.
+    std::atomic<std::chrono::steady_clock::time_point::rep> last_put_time{0};
+    std::atomic<bool> save_thread_started{false};
+    std::atomic<bool> stop_save_thread{false};
+
+    // A snapshot of the cache, taken under the lock and written to disk after
+    // releasing it. Copying a few hundred MB of strings is orders of magnitude
+    // cheaper than writing them, and it keeps the lock off the disk path.
+    std::vector<CacheEntry> SnapshotLocked() const;
+    void WriteSnapshot(const std::vector<CacheEntry>& snapshot);
+    void FlushToDisk();
+    void SaveThreadLoop();
+    void MaybeStartSaveThread();
+
+    // Guards cacheList, cacheMap, cacheSize, dirty.
     // Taken in getByHash/putByHash (runtime hot paths) and in save().
     // load() runs inside the constructor (single-threaded, before the
     // singleton is published) and does not take the lock; its catch block
     // calls save() which acquires the lock — safe because load() does not
-    // hold it. saveLocked() assumes the lock is already held and is used
-    // by putByHash() to persist periodically without re-locking.
+    // hold it. FlushToDisk() takes the lock only to copy a snapshot and
+    // writes to disk with the lock released.
     std::mutex cacheMutex;
 
     static std::array<uint8_t, 32> computeSHA256(const char* data);
     void maintainCacheSize();
-    void saveLocked();  // assumes cacheMutex is held
 };
 
 #endif

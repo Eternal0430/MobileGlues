@@ -161,6 +161,121 @@ void LogOpenGLExtensions() {
 
 struct gles_caps_t g_gles_caps;
 
+// =============================================================================
+// Persistent mapping probe
+// =============================================================================
+namespace {
+
+// Minecraft 26.3 maps its dynamic uniform buffers like this:
+//     target : GlUtil.selectBufferBindTarget(130) = 35345 = GL_UNIFORM_BUFFER
+//     storage: GlConst.bufferUsageToGlFlag(130)   = 0xC2 = WRITE|PERSISTENT|COHERENT
+//     mapping: GlBuffer$Direct builds 34 | 192
+//              = 0xE2 = WRITE|UNSYNCHRONIZED|PERSISTENT|COHERENT
+//     size   : roundToward(TRANSFORM_UBO_SIZE=160, 256) * capacity(2) = 512
+//
+// Advertising GL_ARB_buffer_storage promises all of that works. A driver can
+// publish the extension string and resolve every entry point and still refuse
+// the mapping — which only surfaces much later as "IllegalStateException:
+// Failed to map buffer", with no GL error in between and no surviving trace.
+//
+// So ask the driver directly, once, at start-up, using the game's own target
+// and size. Every combination is tried independently rather than stopping at
+// the first success: the earlier probe only reported the first rung and left
+// the others as "FAILED", which made a working driver look broken.
+//
+// The numbers are written out rather than spelled with GL_ names because the
+// mapping flags the game uses are not a combination any header defines.
+constexpr GLenum kProbeTargets[] = {0x8892 /* GL_ARRAY_BUFFER */, 0x8A11 /* GL_UNIFORM_BUFFER */};
+constexpr const char* kProbeTargetNames[] = {"ARRAY_BUFFER", "UNIFORM_BUFFER"};
+constexpr int kProbeTargetCount = 2;
+
+constexpr GLbitfield kProbeStorageFlags = 0xC2; // WRITE|PERSISTENT|COHERENT
+constexpr GLbitfield kProbeFlagSets[] = {
+    0xE2, // exactly what the game asks for
+    0xC2, // with UNSYNCHRONIZED stripped (what buffer.cpp sends)
+    0x02, // plain WRITE, no persistence at all
+};
+constexpr const char* kProbeFlagNames[] = {"E2", "C2", "W"};
+constexpr int kProbeFlagCount = 3;
+constexpr GLsizeiptr kProbeSize = 512; // the game's actual ring-buffer size
+
+struct PersistentProbe {
+    bool ran = false;
+    bool storageOk[kProbeTargetCount] = {false, false};
+    GLenum storageErr[kProbeTargetCount] = {GL_NO_ERROR, GL_NO_ERROR};
+    bool mapOk[kProbeTargetCount][kProbeFlagCount] = {};
+    GLenum mapErr[kProbeTargetCount][kProbeFlagCount] = {};
+
+    // Whether persistent mapping (either flag set) works on the target the
+    // game actually uses. This is what decides the extension advertisement.
+    bool WorksOnGameTarget() const { return mapOk[1][0] || mapOk[1][1]; }
+};
+
+PersistentProbe ProbePersistentMapping() {
+    PersistentProbe probe;
+
+    if (!GLES.glGenBuffers || !GLES.glBindBuffer || !GLES.glDeleteBuffers || !GLES.glBufferStorageEXT ||
+        !GLES.glMapBufferRange || !GLES.glUnmapBuffer || !GLES.glGetError || !GLES.glGetIntegerv)
+        return probe;
+
+    probe.ran = true;
+
+    for (int t = 0; t < kProbeTargetCount; ++t) {
+        const GLenum target = kProbeTargets[t];
+
+        GLuint buffer = 0;
+        GLES.glGenBuffers(1, &buffer);
+        if (buffer == 0) continue;
+
+        GLint previous = 0;
+        GLES.glGetIntegerv(target == 0x8892 ? GL_ARRAY_BUFFER_BINDING : 0x8A28 /* GL_UNIFORM_BUFFER_BINDING */,
+                           &previous);
+        GLES.glBindBuffer(target, buffer);
+        while (GLES.glGetError() != GL_NO_ERROR) {
+        }
+
+        GLES.glBufferStorageEXT(target, kProbeSize, nullptr, kProbeStorageFlags);
+        probe.storageErr[t] = GLES.glGetError();
+        probe.storageOk[t] = (probe.storageErr[t] == GL_NO_ERROR);
+        if (!probe.storageOk[t]) {
+            GLES.glBindBuffer(target, (GLuint)previous);
+            GLES.glDeleteBuffers(1, &buffer);
+            while (GLES.glGetError() != GL_NO_ERROR) {
+            }
+            continue;
+        }
+
+        for (int f = 0; f < kProbeFlagCount; ++f) {
+            // A fresh buffer per attempt: some drivers keep a buffer mapped
+            // after a failed call, which would poison every later attempt.
+            GLuint b = 0;
+            GLES.glGenBuffers(1, &b);
+            if (b == 0) continue;
+            GLES.glBindBuffer(target, b);
+            GLES.glBufferStorageEXT(target, kProbeSize, nullptr, kProbeStorageFlags);
+            while (GLES.glGetError() != GL_NO_ERROR) {
+            }
+
+            void* ptr = GLES.glMapBufferRange(target, 0, kProbeSize, kProbeFlagSets[f]);
+            probe.mapErr[t][f] = GLES.glGetError();
+            probe.mapOk[t][f] = (ptr != nullptr);
+            if (ptr) GLES.glUnmapBuffer(target);
+
+            GLES.glDeleteBuffers(1, &b);
+            while (GLES.glGetError() != GL_NO_ERROR) {
+            }
+        }
+
+        GLES.glBindBuffer(target, (GLuint)previous);
+        GLES.glDeleteBuffers(1, &buffer);
+        while (GLES.glGetError() != GL_NO_ERROR) {
+        }
+    }
+    return probe;
+}
+
+} // namespace
+
 void InitGLESCapabilities() {
     memset(&g_gles_caps, 0, sizeof(struct gles_caps_t));
 
@@ -263,8 +378,41 @@ void InitGLESCapabilities() {
 
     // ---- Map optional ES extensions to desktop GL extensions ----
 
-    if (g_gles_caps.GL_EXT_buffer_storage) {
-        AppendExtension("GL_ARB_buffer_storage");
+    // Advertise ARB_buffer_storage only when the driver can actually back it
+    // up. Three things have to hold, and they are independent of each other:
+    //   1. the extension string (from glGetStringi)
+    //   2. the entry point (from eglGetProcAddress)
+    //   3. a working persistent mapping (proven, not assumed)
+    // Failing 1 or 2 makes glBufferStorage a silent no-op: no storage, no GL
+    // error. Failing 3 does allocate the storage but leaves the first
+    // glMapBufferRange returning NULL. Either way the game dies in
+    // RenderSystem.initRenderer with "Failed to map buffer".
+    LOG_I("%sDetected GL_EXT_buffer_storage! (glBufferStorageEXT %s)",
+          g_gles_caps.GL_EXT_buffer_storage ? "" : "Not ", GLES.glBufferStorageEXT ? "resolved" : "MISSING")
+
+    const bool haveStorageExt = g_gles_caps.GL_EXT_buffer_storage && GLES.glBufferStorageEXT;
+    if (g_gles_caps.GL_EXT_buffer_storage && !GLES.glBufferStorageEXT) {
+        LOG_W_FORCE("GL_EXT_buffer_storage is advertised but glBufferStorageEXT could not be resolved; "
+                    "withholding GL_ARB_buffer_storage so callers use mutable buffers")
+    } else if (haveStorageExt) {
+        const PersistentProbe probe = ProbePersistentMapping();
+        for (int t = 0; t < kProbeTargetCount; ++t) {
+            LOG_I("Persistent map probe [%s]: storage=%s(0x%x) E2=%s(0x%x) C2=%s(0x%x) W=%s(0x%x)",
+                  kProbeTargetNames[t], probe.storageOk[t] ? "ok" : "FAILED", probe.storageErr[t],
+                  probe.mapOk[t][0] ? "ok" : "FAILED", probe.mapErr[t][0], probe.mapOk[t][1] ? "ok" : "FAILED",
+                  probe.mapErr[t][1], probe.mapOk[t][2] ? "ok" : "FAILED", probe.mapErr[t][2])
+        }
+
+        if (probe.WorksOnGameTarget()) {
+            if (!probe.mapOk[1][0] && probe.mapOk[1][1]) {
+                LOG_I("Persistent mapping needs UNSYNCHRONIZED stripped; buffer.cpp already does this")
+            }
+            AppendExtension("GL_ARB_buffer_storage");
+        } else {
+            LOG_W_FORCE("Persistent mapping is unusable on GL_UNIFORM_BUFFER (storage %s, E2 and C2 both failed); "
+                        "withholding GL_ARB_buffer_storage so the game allocates mutable buffers",
+                        probe.storageOk[1] ? "ok" : "FAILED")
+        }
     }
 
     if (g_gles_caps.EXT_disjoint_timer_query && global_settings.ext_timer_query) {
@@ -280,6 +428,17 @@ void InitGLESCapabilities() {
 
     // Anisotropic texture filtering — only if detected on the GLES side
     if (g_gles_caps.EXT_texture_filter_anisotropic) {
+        // Report the real ceiling. Minecraft 26.3 validates the sampler's
+        // anisotropy against it and throws when the range is empty:
+        //     IllegalArgumentException: maxAnisotropy out of range;
+        //     must be >= 1 and <= 0, but was 1
+        // so a host that leaves it at 0 is worth naming here, in the part of
+        // the log that survives — gl/getter.cpp substitutes 16 in that case.
+        GLint max_anisotropy = 0;
+        if (GLES.glGetIntegerv) GLES.glGetIntegerv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &max_anisotropy);
+        LOG_I("%sDetected GL_EXT_texture_filter_anisotropic! (maxAnisotropy=%d%s)",
+              g_gles_caps.EXT_texture_filter_anisotropic ? "" : "Not ", max_anisotropy,
+              max_anisotropy > 0 ? "" : " — host did not answer, 16 will be substituted")
         AppendExtension("GL_EXT_texture_filter_anisotropic");
     }
 
