@@ -328,18 +328,23 @@ bool TryBind(EGLDisplay dpy, EGLContext ctx, EGLSurface surf, const char* what) 
 bool BindFallbackEGLContextIfNeeded() {
     if (!g_fallback_context_ready) return false;
 
+    // Only the one the hot path uses. The other five used to be resolved here
+    // too, and each LOAD_EGL is a static variable load plus a first-time branch
+    // — paid on every GL call, since this runs before the fast exit below. They
+    // are now resolved inside the branches that actually call them. This
+    // function is entered on every guarded GL call, and for calls the wrappers
+    // short-circuit (glUseProgram, glActiveTexture and glScissor all return
+    // early when the value is unchanged) it is the entire cost of the call.
     LOAD_EGL(eglGetCurrentContext);
-    LOAD_EGL(eglGetCurrentSurface);
-    LOAD_EGL(eglGetCurrentDisplay);
-    LOAD_EGL(eglMakeCurrent);
-    LOAD_EGL(eglDestroyContext);
-    LOAD_EGL(eglGetError);
 
     // Hot path: one atomic load. The record itself is behind a lock, so it is
     // only read when the generation says something actually changed.
     const unsigned gen = mg_egl_app_target_generation();
     if (gen != t_seen_generation) {
         t_seen_generation = gen;
+        LOAD_EGL(eglMakeCurrent);
+        LOAD_EGL(eglDestroyContext);
+        LOAD_EGL(eglGetError);
         const AppRenderTarget& t = mg_egl_app_target();
 
         // Follow the application's render target as it changes.
@@ -434,6 +439,12 @@ bool BindFallbackEGLContextIfNeeded() {
     //
     // Retry whenever the application's render target has changed, since that is
     // exactly when a previously impossible binding may have become possible.
+    LOAD_EGL(eglGetCurrentSurface);
+    LOAD_EGL(eglGetCurrentDisplay);
+    LOAD_EGL(eglMakeCurrent);
+    LOAD_EGL(eglDestroyContext);
+    LOAD_EGL(eglGetError);
+
     if (t_fb.tried && gen == t_fb.tried_generation) return false;
     t_fb.tried = true;
     t_fb.tried_generation = gen;
@@ -805,13 +816,33 @@ static void RepairSdlCurrentWindow() {
     if (ok) g_sdl_repair_done = true;
 }
 
+// How many calls a thread accumulates before publishing them to the shared
+// counter.
+//
+// The counter is global and written from every thread that makes a GL call, so
+// touching it once per call made its cache line bounce between cores: at the
+// call rates seen here — a watchdog period measured 304696 guarded calls in 20
+// seconds — that is a write to a contended line roughly fifteen thousand times
+// a second, from each thread, to feed a number that is read once every 20
+// seconds.
+//
+// Accumulating per thread and publishing in batches removes the contention
+// without changing what the watchdog reports: it samples every 20 seconds, so a
+// count that lags by at most one batch is indistinguishable from an exact one.
+constexpr unsigned long kCallBatchSize = 4096;
+
 void mg_egl_note_guarded_call(const char* entry_point) {
     static thread_local unsigned long t_calls = 0;
+    static thread_local unsigned long t_published = 0;
     ++t_calls;
 
-    // One relaxed atomic increment per call. It feeds the watchdog's "is the
-    // game still drawing" line and nothing else.
-    g_guarded_calls.fetch_add(1, std::memory_order_relaxed);
+    // Thread-local arithmetic, then one relaxed atomic per batch instead of one
+    // per call.
+    const unsigned long pending = t_calls - t_published;
+    if (pending >= kCallBatchSize) {
+        g_guarded_calls.fetch_add(pending, std::memory_order_relaxed);
+        t_published = t_calls;
+    }
     VerifyContextStillCurrent(t_calls);
 
     // The repair below is the fix for the black screen, so it has to run — but
