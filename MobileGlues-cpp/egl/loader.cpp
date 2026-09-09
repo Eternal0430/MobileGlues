@@ -736,7 +736,7 @@ void mg_egl_activate_window_surface(EGLDisplay dpy, EGLSurface surface) {
 // fallback was deleted, which made the link fail with
 // "undefined symbol: mg_egl_note_call(char const*)" — a fault that -fsyntax-only
 // cannot catch, because each translation unit still compiles fine on its own.
-void mg_egl_note_call(const char* entry_point) {
+void mg_egl_note_call() {
     if (!g_watchdog_started.exchange(true)) {
         std::thread(WatchdogLoop).detach();
     }
@@ -831,7 +831,7 @@ static void RepairSdlCurrentWindow() {
 // count that lags by at most one batch is indistinguishable from an exact one.
 constexpr unsigned long kCallBatchSize = 4096;
 
-void mg_egl_note_guarded_call(const char* entry_point) {
+void mg_egl_note_guarded_call() {
     static thread_local unsigned long t_calls = 0;
     static thread_local unsigned long t_published = 0;
     ++t_calls;

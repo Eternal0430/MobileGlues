@@ -197,7 +197,7 @@ GLint QueryHostInt(GLenum pname) {
 
     // Maybe the thread simply had no context: re-read with ours bound.
     {
-        ScopedHostContext scoped(__func__);
+        ScopedHostContext scoped;
         if (scoped.Bound() && GLES.glGetIntegerv) {
             GLint retry = 0;
             GLES.glGetIntegerv(pname, &retry);
@@ -271,7 +271,7 @@ void mg_guard_host_limit_i64(GLenum pname, GLint64* params) {
     if (!params || *params > 0) return;
 
     {
-        ScopedHostContext scoped(__func__);
+        ScopedHostContext scoped;
         if (scoped.Bound() && GLES.glGetInteger64v) {
             GLint64 retry = 0;
             GLES.glGetInteger64v(pname, &retry);
@@ -556,7 +556,7 @@ const GLubyte* QueryHostString(GLenum name) {
     const GLubyte* str = GLES.glGetString(name);
     if (str && *str) return str;
 
-    ScopedHostContext scoped(__func__);
+    ScopedHostContext scoped;
     if (scoped.Bound()) {
         const GLubyte* retry = GLES.glGetString(name);
         if (retry && *retry) {
@@ -873,7 +873,7 @@ const GLubyte* glGetString(GLenum name) {
 // =============================================================================
 
 const GLubyte* glGetStringi(GLenum name, GLuint index) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     LOG()
 
     if (name == GL_EXTENSIONS + GL_BACKEND_GETTER_MG && global_settings.hide_mg_env_level == HideMGEnvLevel::Disabled) {
@@ -973,7 +973,7 @@ const GLubyte* glGetStringi(GLenum name, GLuint index) {
 // =============================================================================
 
 void glGetQueryObjectiv(GLuint id, GLenum pname, GLint* params) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     LOG()
     if (GLES.glGetQueryObjectivEXT) {
         GLES.glGetQueryObjectivEXT(id, pname, params);
@@ -982,7 +982,7 @@ void glGetQueryObjectiv(GLuint id, GLenum pname, GLint* params) {
 }
 
 void glGetQueryObjecti64v(GLuint id, GLenum pname, GLint64* params) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     LOG()
     if (GLES.glGetQueryObjecti64vEXT) {
         GLES.glGetQueryObjecti64vEXT(id, pname, params);

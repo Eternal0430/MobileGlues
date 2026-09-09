@@ -228,15 +228,17 @@ extern "C"
 // Counts every guarded host GL call, across all threads, and attributes it to
 // the entry point that made it. Read by the watchdog below: if the count stops
 // growing, the game is stalled somewhere that is not making GL calls; if it
-// keeps growing while nothing is presented, the watchdog's per-entry breakdown
-// shows exactly which call is being repeated.
-void mg_egl_note_guarded_call(const char* entry_point);
+// keeps growing while nothing is presented, something is consuming GL work
+// without ever reaching a frame.
+//
+// Takes no argument: it used to be given the entry point name, which was fed to
+// a per-call histogram. The histogram was removed (it ran on every call to feed
+// a ranking only needed while diagnosing), and with it the only use of the name.
+void mg_egl_note_guarded_call();
 
 class ScopedHostContext {
 public:
-    ScopedHostContext(const char* entry_point) : bound_(BindFallbackEGLContextIfNeeded()) {
-        mg_egl_note_guarded_call(entry_point);
-    }
+    ScopedHostContext() : bound_(BindFallbackEGLContextIfNeeded()) { mg_egl_note_guarded_call(); }
     ~ScopedHostContext() {
         if (bound_) UnbindFallbackEGLContext();
     }
@@ -333,7 +335,10 @@ void mg_egl_forget_surface(EGLSurface surface);
 void mg_egl_record_display(EGLDisplay dpy);
 EGLBoolean mg_egl_present(EGLDisplay dpy, EGLSurface surface);
 
-void mg_egl_note_call(const char* entry_point);
+// Called by every EGL entry point. Starts the watchdog on the first one, and
+// nothing else — it used to also feed a per-call histogram, which took the
+// entry point name; the histogram is gone, so the name went with it.
+void mg_egl_note_call();
 
 // Called right after a window surface is created, to bind the application's
 // context to it on the spot.

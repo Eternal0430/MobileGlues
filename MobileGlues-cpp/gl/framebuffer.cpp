@@ -110,7 +110,7 @@ static size_t g_tempFboPoolIndex = 0;
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glGenFramebuffers(GLsizei n, GLuint *framebuffers) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     LOG()
     GLES.glGenFramebuffers(n, framebuffers);
 
@@ -122,7 +122,7 @@ extern "C" GLAPI GLAPIENTRY void glGenFramebuffers(GLsizei n, GLuint *framebuffe
 }
 
 extern "C" GLAPI GLAPIENTRY void glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     LOG()
     GLES.glDeleteFramebuffers(n, framebuffers);
 
@@ -145,7 +145,7 @@ extern "C" GLAPI GLAPIENTRY void glDeleteFramebuffers(GLsizei n, const GLuint *f
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glBindFramebuffer(GLenum target, GLuint framebuffer) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     LOG()
     GLES.glBindFramebuffer(target, framebuffer);
 
@@ -173,7 +173,7 @@ extern "C" GLAPI GLAPIENTRY void glBindFramebuffer(GLenum target, GLuint framebu
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     LOG()
     GLenum esTexTarget = GLStateManager::ConvertTextureTarget(textarget);
     GLES.glFramebufferTexture2D(target, attachment, esTexTarget, texture, level);
@@ -187,7 +187,7 @@ extern "C" GLAPI GLAPIENTRY void glFramebufferTexture2D(GLenum target, GLenum at
 // When the pointer is NULL, emulate via glFramebufferTexture2D (2D/cube) or
 // glFramebufferTextureLayer (2D-array/3D, layer 0).
 extern "C" GLAPI GLAPIENTRY void glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     LOG()
     if (GLES.glFramebufferTexture != nullptr) {
         GLES.glFramebufferTexture(target, attachment, texture, level);
@@ -217,7 +217,7 @@ extern "C" GLAPI GLAPIENTRY void glFramebufferTexture(GLenum target, GLenum atta
 }
 
 extern "C" GLAPI GLAPIENTRY void glFramebufferTextureLayer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     GLES.glFramebufferTextureLayer(target, attachment, texture, level, layer);
     track_fbo_attachment(target, attachment, texture);
 }
@@ -227,7 +227,7 @@ extern "C" GLAPI GLAPIENTRY void glFramebufferTextureLayer(GLenum target, GLenum
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     GLES.glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
 }
 
@@ -253,7 +253,7 @@ extern "C" GLAPI GLAPIENTRY void glFramebufferRenderbuffer(GLenum target, GLenum
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY GLenum glCheckFramebufferStatus(GLenum target) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     LOG()
     GLenum status = GLES.glCheckFramebufferStatus(target);
     if (status == GL_FRAMEBUFFER_COMPLETE) return status;
@@ -327,7 +327,7 @@ extern "C" GLAPI GLAPIENTRY GLenum glCheckFramebufferStatus(GLenum target) {
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glFramebufferParameteri(GLenum target, GLenum pname, GLint param) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     GLES.glFramebufferParameteri(target, pname, param);
 }
 
@@ -336,7 +336,7 @@ extern "C" GLAPI GLAPIENTRY void glFramebufferParameteri(GLenum target, GLenum p
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glGetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment, GLenum pname, GLint *params) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     GLES.glGetFramebufferAttachmentParameteriv(target, attachment, pname, params);
 }
 
@@ -345,7 +345,7 @@ extern "C" GLAPI GLAPIENTRY void glGetFramebufferAttachmentParameteriv(GLenum ta
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glGetFramebufferParameteriv(GLenum target, GLenum pname, GLint *params) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     GLES.glGetFramebufferParameteriv(target, pname, params);
 }
 
@@ -356,7 +356,7 @@ extern "C" GLAPI GLAPIENTRY void glGetFramebufferParameteriv(GLenum target, GLen
 extern "C" GLAPI GLAPIENTRY void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
                        GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
                        GLbitfield mask, GLenum filter) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     // Strip GL_ACCUM_BUFFER_BIT
     mask &= ~0x00000200;
     GLES.glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
@@ -367,13 +367,13 @@ extern "C" GLAPI GLAPIENTRY void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLi
 // ============================================================================
 
 extern "C" GLAPI GLAPIENTRY void glInvalidateFramebuffer(GLenum target, GLsizei numAttachments, const GLenum *attachments) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     GLES.glInvalidateFramebuffer(target, numAttachments, attachments);
 }
 
 extern "C" GLAPI GLAPIENTRY void glInvalidateSubFramebuffer(GLenum target, GLsizei numAttachments, const GLenum *attachments,
                                 GLint x, GLint y, GLsizei width, GLsizei height) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     GLES.glInvalidateSubFramebuffer(target, numAttachments, attachments, x, y, width, height);
 }
 

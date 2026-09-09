@@ -1921,7 +1921,7 @@ void glMultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GL
 }
 
 void glMultiDrawArraysIndirect(GLenum mode, const void* indirect, GLsizei drawcount, GLsizei stride) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     LOG()
     if (drawcount <= 0) return;
     if (stride < 0) {
@@ -1956,7 +1956,7 @@ void glMultiDrawArraysIndirect(GLenum mode, const void* indirect, GLsizei drawco
 
 void glMultiDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect, GLsizei drawcount,
                                  GLsizei stride) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     LOG()
     if (drawcount <= 0) return;
     if (stride < 0) {

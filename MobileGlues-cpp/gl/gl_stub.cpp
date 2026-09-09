@@ -1742,15 +1742,15 @@ extern "C" GLAPI GLAPIENTRY void glQueryCounterEXT(GLuint id, GLenum target) {
     // No GLES equivalent for glQueryCounter; core GL stub is also a no-op
 }
 extern "C" GLAPI GLAPIENTRY void glGetQueryObjectivEXT(GLuint id, GLenum pname, GLint* params) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     GLES.glGetQueryObjectivEXT(id, pname, params);
 }
 extern "C" GLAPI GLAPIENTRY void glGetQueryObjecti64vEXT(GLuint id, GLenum pname, GLint64* params) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     GLES.glGetQueryObjecti64vEXT(id, pname, params);
 }
 extern "C" GLAPI GLAPIENTRY void glGetQueryObjectui64vEXT(GLuint id, GLenum pname, GLuint64* params) {
-    ScopedHostContext __hostCtx(__func__);
+    ScopedHostContext __hostCtx;
     GLint64 v;
     GLES.glGetQueryObjecti64vEXT(id, pname, &v);
     *params = static_cast<GLuint64>(v);
