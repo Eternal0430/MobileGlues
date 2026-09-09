@@ -831,13 +831,6 @@ static void RepairSdlCurrentWindow() {
 // count that lags by at most one batch is indistinguishable from an exact one.
 constexpr unsigned long kCallBatchSize = 4096;
 
-// Readable from egl.cpp for frame timing. Defined outside the anonymous
-// namespace on purpose: g_guarded_calls is internal to this translation unit, so
-// it cannot be declared extern there, and a definition placed beside it inherits
-// internal linkage and fails to link — which is what happened on the first
-// attempt. The compiler accepts it either way; only nm shows the difference.
-unsigned long mg_egl_guarded_call_count() { return g_guarded_calls.load(std::memory_order_relaxed); }
-
 void mg_egl_note_guarded_call() {
     static thread_local unsigned long t_calls = 0;
     static thread_local unsigned long t_published = 0;
@@ -867,10 +860,16 @@ void mg_egl_note_guarded_call() {
         }
     }
 
-    if (!g_watchdog_started.exchange(true)) {
-        // Detached and deliberately never joined: it outlives the GL session and
-        // costs one wake-up every 20 seconds.
-        std::thread(WatchdogLoop).detach();
+    // A relaxed load first: exchange() is a write, and issuing one on every call
+    // keeps this cache line bouncing between cores for the life of the process.
+    // This runs once per guarded GL call — all of them, on every thread. After
+    // the first call the load is true and the exchange is never reached again.
+    if (!g_watchdog_started.load(std::memory_order_relaxed)) {
+        if (!g_watchdog_started.exchange(true, std::memory_order_relaxed)) {
+            // Detached and deliberately never joined: it outlives the GL session
+            // and costs one wake-up every 20 seconds.
+            std::thread(WatchdogLoop).detach();
+        }
     }
 }
 

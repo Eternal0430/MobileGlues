@@ -1195,41 +1195,49 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
             ((flags & GL_MAP_PERSISTENT_BIT) != 0 || (flags & GL_DYNAMIC_STORAGE_BIT) != 0))
             flags |= (GL_MAP_WRITE_BIT | GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT);
 
-        // Clear any pending error before this call, otherwise the check below
-        // reports an error left by earlier, unrelated work and the allocation is
-        // blamed for something it did not do. This very log showed a rejection
-        // with flags=0x102 (DYNAMIC_STORAGE|WRITE), a combination the driver
-        // accepts everywhere else — the report was stale, not real.
-        if (GLES.glGetError) {
+        // glGetError is an implicit glFinish on most drivers: asking for the error
+        // queue makes the CPU wait for the GPU to drain. This layer already knows
+        // that — its own glGetError export is wrapped in GLOBAL_DEBUG and returns
+        // GL_NO_ERROR in release builds, with a comment saying exactly this — and
+        // yet this call site queried the host unconditionally: a drain loop of up
+        // to eight reads before the allocation, and another read after it.
+        //
+        // The cost lands on the worst possible path. Sodium allocates chunk vertex
+        // buffers here, so every chunk upload while moving through the world paid
+        // for a full pipeline flush — repeatedly, every frame. That is the
+        // difference against a build that does not ask.
+        //
+        // Whether the driver rejects a given (target, size, flags) combination is
+        // not intermittent: it answers the same way every time, which is what the
+        // old "rejected N times" lines were reporting. So a few early probes see
+        // it, and after that the question is never asked again.
+        static std::atomic<int> storage_probe_budget{8};
+        const bool probe = GLES.glGetError && storage_probe_budget.load(std::memory_order_relaxed) > 0;
+
+        if (!probe) {
+            GLES.glBufferStorageEXT(target, size, data, flags);
+        } else {
+            storage_probe_budget.fetch_sub(1, std::memory_order_relaxed);
+
+            // Clear pending errors first, otherwise the check below reports
+            // something earlier work left behind and blames this allocation for
+            // it. One such stale report was flags=0x102 (DYNAMIC_STORAGE|WRITE),
+            // a combination the driver accepts everywhere else.
             for (int drain = 0; drain < 8; ++drain) {
                 if (GLES.glGetError() == GL_NO_ERROR) break;
             }
-        }
-        GLES.glBufferStorageEXT(target, size, data, flags);
+            GLES.glBufferStorageEXT(target, size, data, flags);
 
-        // CHECK_GL_ERROR compiles to nothing in release builds, so a rejected
-        // allocation would leave the buffer with no storage and leave no trace
-        // at all — the caller only finds out later, when glMapBufferRange
-        // returns NULL. Report the first rejection, and keep counting: the
-        // failure repeats on every chunk upload, and a single "warn once" line
-        // made a per-frame problem look like a one-off.
-        if (GLES.glGetError) {
-            static bool storage_warned_once = false;
-            static std::atomic<unsigned long> storage_rejections{0};
+            // CHECK_GL_ERROR compiles to nothing in release builds, so a rejected
+            // allocation leaves the buffer with no storage and no trace — the
+            // caller only finds out later, when glMapBufferRange returns NULL.
             const GLenum err = GLES.glGetError();
             if (err != GL_NO_ERROR) {
-                const unsigned long n = storage_rejections.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (!storage_warned_once) {
-                    storage_warned_once = true;
-                    LOG_W_FORCE("glBufferStorage was rejected: target=%s(0x%x) size=%lld flags=0x%x glError=0x%x — the "
-                                "buffer has no storage, so a later glMapBufferRange will return NULL",
-                                glEnumToString(target), target, (long long)size, flags, err);
-                }
-                if (n == 100 || n == 1000 || n == 10000) {
-                    LOG_W_FORCE("glBufferStorage has been rejected %lu times (last: target=%s flags=0x%x err=0x%x) — "
-                                "uploads to these buffers are being lost every frame",
-                                n, glEnumToString(target), flags, err);
-                }
+                LOG_W_FORCE("glBufferStorage was rejected: target=%s(0x%x) size=%lld flags=0x%x glError=0x%x — the "
+                            "buffer has no storage, so a later glMapBufferRange will return NULL. Probed on the "
+                            "first few calls only: glGetError stalls the pipeline, so asking per call is what cost "
+                            "the frame rate.",
+                            glEnumToString(target), target, (long long)size, flags, err);
             }
         }
 
