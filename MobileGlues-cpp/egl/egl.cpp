@@ -400,7 +400,6 @@ void mg_egl_note_window_surface(EGLDisplay dpy, EGLConfig config, EGLSurface sur
 
     const bool replaced = g_target.have_surface;
     g_target.display = dpy;
-    g_target.config = config;
     g_target.draw_surface = surface;
     g_target.read_surface = surface;
     g_target.have_surface = true;

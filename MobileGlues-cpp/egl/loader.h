@@ -274,7 +274,6 @@ struct AppRenderTarget {
     EGLSurface draw_surface = EGL_NO_SURFACE;
     EGLSurface read_surface = EGL_NO_SURFACE;
     EGLContext context = EGL_NO_CONTEXT;
-    EGLConfig config = nullptr;
     bool have_surface = false;  // a window surface was created
     bool have_binding = false;  // a context was successfully made current
 
