@@ -860,10 +860,16 @@ void mg_egl_note_guarded_call() {
         }
     }
 
-    if (!g_watchdog_started.exchange(true)) {
-        // Detached and deliberately never joined: it outlives the GL session and
-        // costs one wake-up every 20 seconds.
-        std::thread(WatchdogLoop).detach();
+    // A relaxed load first: exchange() is a write, and issuing one on every call
+    // keeps this cache line bouncing between cores for the life of the process.
+    // This runs once per guarded GL call — all of them, on every thread. After
+    // the first call the load is true and the exchange is never reached again.
+    if (!g_watchdog_started.load(std::memory_order_relaxed)) {
+        if (!g_watchdog_started.exchange(true, std::memory_order_relaxed)) {
+            // Detached and deliberately never joined: it outlives the GL session
+            // and costs one wake-up every 20 seconds.
+            std::thread(WatchdogLoop).detach();
+        }
     }
 }
 
