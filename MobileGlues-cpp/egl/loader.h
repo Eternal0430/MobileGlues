@@ -236,6 +236,9 @@ extern "C"
 // a ranking only needed while diagnosing), and with it the only use of the name.
 void mg_egl_note_guarded_call();
 
+// Running total of guarded host GL calls, for frame timing in egl.cpp.
+unsigned long mg_egl_guarded_call_count();
+
 class ScopedHostContext {
 public:
     ScopedHostContext() : bound_(BindFallbackEGLContextIfNeeded()) { mg_egl_note_guarded_call(); }

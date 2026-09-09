@@ -15,6 +15,7 @@
 #include "loader.h"
 #include <algorithm>
 #include <cstring>
+#include <ctime>
 #include <unordered_map>
 #include <vector>
 
@@ -976,7 +977,89 @@ extern "C"
                 LOG_W_FORCE("EGL-TRACE: eglSwapBuffers #%lu dpy=%p surface=%p", n, dpy, surface);
             }
         }
+        //
+        // Frame timing: two numbers that have to be told apart before anything
+        // can be said about frame rate.
+        //
+        //   swap cost  — how long eglSwapBuffers itself blocked. Near 16.7ms or
+        //                33.3ms on a 60Hz panel means the frame rate is set by
+        //                vsync, and no amount of CPU work is the cause.
+        //   frame cost — wall time since the previous swap began. Far larger than
+        //                the swap cost means the time goes somewhere else, and
+        //                changing the swap path will not help.
+        //
+        // Reported with the GL calls made in between: a 30ms frame with 40 calls
+        // and one with 4000 point at completely different causes.
+        //
+        // clock_gettime(CLOCK_MONOTONIC) is vDSO-backed on Android — no syscall,
+        // around 20ns — and this runs once per frame, so the measurement cannot
+        // be the thing it measures.
         LOG_D("eglSwapBuffers, dpy: %p, surface: %p", dpy, surface);
+        {
+            static std::atomic<unsigned long> count{0};
+            static std::atomic<unsigned long> swap_ns{0};
+            static std::atomic<unsigned long> frame_ns{0};
+            static std::atomic<unsigned long> calls_sum{0};
+            static std::atomic<unsigned long> period_swaps{0};
+            static std::atomic<unsigned long> calls_at_last_report{0};
+
+            const unsigned long n = count.fetch_add(1, std::memory_order_relaxed);
+            struct timespec t0;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+
+            const unsigned long calls_now = mg_egl_guarded_call_count();
+            if (n == 0) calls_at_last_report.store(calls_now, std::memory_order_relaxed);
+
+            const bool report = (n < 5) || ((n % 120) == 0);
+
+            // A local class cannot name the enclosing function's parameters, so
+            // everything it needs is handed to it.
+            struct SwapTimer {
+                struct timespec start;
+                bool report;
+                unsigned long seq;
+                EGLDisplay dpy;
+                EGLSurface surface;
+                ~SwapTimer() {
+                    struct timespec end;
+                    clock_gettime(CLOCK_MONOTONIC, &end);
+                    const unsigned long ns = static_cast<unsigned long>(end.tv_sec - start.tv_sec) * 1000000000ul +
+                                            static_cast<unsigned long>(end.tv_nsec - start.tv_nsec);
+                    swap_ns.fetch_add(ns, std::memory_order_relaxed);
+                    period_swaps.fetch_add(1, std::memory_order_relaxed);
+                    if (!report) return;
+                    const unsigned long ps = period_swaps.load(std::memory_order_relaxed);
+                    const unsigned long sn = swap_ns.load(std::memory_order_relaxed);
+                    const unsigned long fn = frame_ns.load(std::memory_order_relaxed);
+                    const unsigned long cs = calls_sum.load(std::memory_order_relaxed);
+                    LOG_W_FORCE("EGL-TRACE: eglSwapBuffers #%lu dpy=%p surface=%p | avg swap %.2fms avg frame "
+                                "%.2fms (%.1f fps) | ~%lu GL calls/frame",
+                                seq, dpy, surface, sn / 1000000.0 / (ps ? ps : 1),
+                                fn / 1000000.0 / (ps ? ps : 1),
+                                fn > 0 ? (1000000000.0 * ps / fn) : 0.0, ps ? cs / ps : 0);
+                    // Reset for the next window: the average has to be over this
+                    // period only, otherwise it drifts toward the first frames and
+                    // never reflects the current state.
+                    swap_ns.store(0, std::memory_order_relaxed);
+                    frame_ns.store(0, std::memory_order_relaxed);
+                    calls_sum.store(0, std::memory_order_relaxed);
+                    period_swaps.store(0, std::memory_order_relaxed);
+                    calls_at_last_report.store(mg_egl_guarded_call_count(), std::memory_order_relaxed);
+                }
+            } swap_timer{t0, report, n, dpy, surface};
+
+            static struct timespec t_prev{0, 0};
+            static bool have_prev = false;
+            if (have_prev) {
+                const unsigned long fns = static_cast<unsigned long>(t0.tv_sec - t_prev.tv_sec) * 1000000000ul +
+                                         static_cast<unsigned long>(t0.tv_nsec - t_prev.tv_nsec);
+                frame_ns.fetch_add(fns, std::memory_order_relaxed);
+                calls_sum.fetch_add(calls_now - calls_at_last_report.load(std::memory_order_relaxed),
+                                    std::memory_order_relaxed);
+            }
+            t_prev = t0;
+            have_prev = true;
+        }
         // SDL presents through the handle cached in its own window, which is a
         // surface it has already asked to destroy. Redirect it to the live one
         // so this present actually lands.
