@@ -236,6 +236,11 @@ extern "C"
 // a ranking only needed while diagnosing), and with it the only use of the name.
 void mg_egl_note_guarded_call();
 
+// Drops this thread's cached "there is a current context" answer. Called when
+// the application binds or releases a context itself, because that is the one
+// event that can make the cached answer wrong before its window expires.
+void mg_egl_invalidate_current_cache();
+
 class ScopedHostContext {
 public:
     ScopedHostContext() : bound_(BindFallbackEGLContextIfNeeded()) { mg_egl_note_guarded_call(); }

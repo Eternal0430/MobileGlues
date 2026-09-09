@@ -787,6 +787,9 @@ extern "C"
 
     EGL_API EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
         mg_egl_note_call();
+        // Whatever this thread believed about having a context is decided here,
+        // so the cache kept by BindFallbackEGLContextIfNeeded() has to go.
+        mg_egl_invalidate_current_cache();
         LOG_D("eglMakeCurrent, dpy: %p, draw: %p, read: %p, ctx: %p", dpy, draw, read, ctx);
         // Same stale-handle problem as the swap: SDL binds the surface it cached
         // when it created the window, which may have been destroyed since.

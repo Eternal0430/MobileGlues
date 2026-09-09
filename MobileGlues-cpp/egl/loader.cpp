@@ -365,23 +365,24 @@ bool TryBind(EGLDisplay dpy, EGLContext ctx, EGLSurface surf, const char* what) 
 
 } // namespace
 
-bool BindFallbackEGLContextIfNeeded() {
-    if (!g_fallback_context_ready) return false;
+// How many guarded GL calls a thread may answer from the cached "this thread has
+// a current context" before it has to ask EGL again. See the comment at the
+// cache in BindFallbackEGLContextImpl(): it is a bounded window, not a
+// permanent belief.
+constexpr unsigned kCtxVerifyInterval = 64;
+thread_local unsigned t_ctx_skip = 0;
 
-    // Only the one the hot path uses. The other five used to be resolved here
-    // too, and each LOAD_EGL is a static variable load plus a first-time branch
-    // — paid on every GL call, since this runs before the fast exit below. They
-    // are now resolved inside the branches that actually call them. This
-    // function is entered on every guarded GL call, and for calls the wrappers
-    // short-circuit (glUseProgram, glActiveTexture and glScissor all return
-    // early when the value is unchanged) it is the entire cost of the call.
-    LOAD_EGL(eglGetCurrentContext);
+static bool BindFallbackEGLContextImpl() {
+    if (!g_fallback_context_ready) return false;
 
     // Hot path: one atomic load. The record itself is behind a lock, so it is
     // only read when the generation says something actually changed.
     const unsigned gen = mg_egl_app_target_generation();
     if (gen != t_seen_generation) {
         t_seen_generation = gen;
+        // The application's render target moved, so whatever this thread cached
+        // about its own binding may be stale: force a real query below.
+        t_ctx_skip = 0;
         LOAD_EGL(eglMakeCurrent);
         LOAD_EGL(eglDestroyContext);
         LOAD_EGL(eglGetError);
@@ -467,9 +468,38 @@ bool BindFallbackEGLContextIfNeeded() {
         }
     }
 
+    // Per-thread cache of the answer above.
+    //
+    // eglGetCurrentContext() is a call into libEGL on every single guarded GL
+    // entry point -- a watchdog period measured 304696 of them in 20 seconds on
+    // this game, and they are all asking the same question with the same answer.
+    // Remembering "this thread had a context" for a short window replaces that
+    // call with a decrement, which is the whole per-call cost of the wrappers
+    // that do nothing else (glUniform*, the short-circuited glBindTexture /
+    // glUseProgram / glActiveTexture).
+    //
+    // The window is deliberately short and is closed early whenever something
+    // could have changed the answer:
+    //   - the application's render target generation moved (handled above),
+    //   - the application called eglMakeCurrent on this thread
+    //     (mg_egl_invalidate_current_cache, from egl/egl.cpp),
+    //   - VerifyContextStillCurrent() re-queries every kVerifyInterval calls.
+    // The worst case is therefore a handful of calls issued into a context that
+    // was released between two verifications -- the same calls the driver would
+    // have discarded anyway before the fallback layer existed.
+    if (t_ctx_skip > 0) {
+        --t_ctx_skip;
+        return false;
+    }
+
+    LOAD_EGL(eglGetCurrentContext);
+
     // Already have a context. This is the path the render thread takes, and the
     // only path any correctly configured thread takes after its first call.
-    if (egl_eglGetCurrentContext() != EGL_NO_CONTEXT) return false;
+    if (egl_eglGetCurrentContext() != EGL_NO_CONTEXT) {
+        t_ctx_skip = kCtxVerifyInterval;
+        return false;
+    }
 
     // `tried` used to be latched for the life of the thread, so a thread whose
     // first attempt failed — because no context was available yet, which is the
@@ -586,6 +616,19 @@ bool BindFallbackEGLContextIfNeeded() {
     return false;
 }
 
+bool BindFallbackEGLContextIfNeeded() {
+    const bool bound = BindFallbackEGLContextImpl();
+    // A context was just made current on this thread, so the next few calls can
+    // skip the query. Nothing is cached when the bind failed: that thread has to
+    // keep asking, and t_fb.tried keeps it from re-running the whole ladder.
+    if (bound) t_ctx_skip = kCtxVerifyInterval;
+    return bound;
+}
+
+// Called from the application's eglMakeCurrent. The thread's own binding just
+// changed, so its cached "I have a context" is no longer trustworthy.
+void mg_egl_invalidate_current_cache() { t_ctx_skip = 0; }
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -606,12 +649,25 @@ namespace {
 // ---------------------------------------------------------------------------
 constexpr unsigned long kVerifyInterval = 4096;
 
+// Defined below; the SDL window repair it guards only ever matters a handful of
+// times, so it is reached from the same periodic gate as the staleness check
+// rather than from its own modulo on every single call.
+static void MaybeRepairSdlCurrentWindow();
+
 void VerifyContextStillCurrent(unsigned long calls_on_this_thread) {
     if ((calls_on_this_thread & (kVerifyInterval - 1)) != 0) return;
 
     LOAD_EGL(eglGetCurrentContext);
     if (!egl_eglGetCurrentContext) return;
-    if (egl_eglGetCurrentContext() != EGL_NO_CONTEXT) return;
+    if (egl_eglGetCurrentContext() != EGL_NO_CONTEXT) {
+        // This is the independent re-check of the cached answer the guarded
+        // wrappers run on: it asked EGL for real and got a context, so the cache
+        // is rearmed here and the next kCtxVerifyInterval calls can skip the
+        // query again.
+        t_ctx_skip = kCtxVerifyInterval;
+        MaybeRepairSdlCurrentWindow();
+        return;
+    }
 
     // The context this thread was given is gone. Re-running the ladder is the
     // only correct response: every GL call from here on would otherwise be
@@ -624,6 +680,9 @@ void VerifyContextStillCurrent(unsigned long calls_on_this_thread) {
                     (unsigned long)pthread_self(), kVerifyInterval);
     }
     t_fb.tried = false;
+    // The cached answer was wrong, so it must not stop the ladder below from
+    // running: BindFallbackEGLContextIfNeeded() would return at the cache.
+    t_ctx_skip = 0;
     BindFallbackEGLContextIfNeeded();
 }
 
@@ -821,7 +880,10 @@ void mg_egl_note_call() {
 //   - SDL_GLContext is the EGLContext pointer on this backend: SDL_EGL_CreateContext
 //     returns (SDL_GLContext)egl_context, and SDL_EGL_MakeCurrent casts it back.
 //   - SDL_GetWindows is exported, so the window can be enumerated.
-static bool g_sdl_repair_done = false;
+// Read from every GL-calling thread and written from the one that binds, so it
+// is atomic: a plain bool here was a data race, and "benign" races on a flag
+// that gates a dlopen are not the kind worth keeping.
+static std::atomic<bool> g_sdl_repair_done{false};
 // Written only from the binding thread, and only after the modulo gate in
 // mg_egl_note_guarded_call, so a plain int needs no synchronisation.
 static std::atomic<int> g_sdl_repair_attempts{0};
@@ -856,6 +918,33 @@ static void RepairSdlCurrentWindow() {
     if (ok) g_sdl_repair_done = true;
 }
 
+// The SDL repair is the fix for the black screen, so it has to run — but it only
+// ever matters a handful of times, and it sits on the path of every single GL
+// call. It used to be reached through its own `% 5000` on the call counter,
+// which meant two independent modulo tests per call (a 64-bit division is not
+// free when it runs hundreds of thousands of times a second). It now shares the
+// gate the staleness check already uses: every kVerifyInterval calls, and only
+// when the cheap relaxed load says it is not finished yet. No atomic write, no
+// mutex, no dlopen, no dlsym unless that has already passed.
+//
+// Defined inside the same unnamed namespace that declares it. A definition at
+// file scope would be a different function from the declaration the staleness
+// check calls, which links to an undefined symbol rather than failing to
+// compile — the build only breaks at the link step, saying nothing about why.
+namespace {
+
+void MaybeRepairSdlCurrentWindow() {
+    if (g_sdl_repair_done.load(std::memory_order_relaxed)) return;
+    const AppRenderTarget& rt = mg_egl_app_target();
+    if (rt.have_binding && rt.binding_thread == (unsigned long)pthread_self()) {
+        const int n = g_sdl_repair_attempts.fetch_add(1, std::memory_order_relaxed) + 1;
+        RepairSdlCurrentWindow();
+        if (n >= 8) g_sdl_repair_done.store(true, std::memory_order_relaxed);
+    }
+}
+
+} // namespace
+
 // How many calls a thread accumulates before publishing them to the shared
 // counter.
 //
@@ -884,21 +973,6 @@ void mg_egl_note_guarded_call() {
         t_published = t_calls;
     }
     VerifyContextStillCurrent(t_calls);
-
-    // The repair below is the fix for the black screen, so it has to run — but
-    // it only ever matters a handful of times, and this function is on the path
-    // of every single GL call. Everything expensive is therefore behind the
-    // cheapest possible test first: an integer modulo on a thread-local, then
-    // a plain non-atomic read. No atomic, no dlopen, no dlsym unless the cheap
-    // test has already passed.
-    if ((t_calls % 5000) == 0 && !g_sdl_repair_done) {
-        const AppRenderTarget& rt = mg_egl_app_target();
-        if (rt.have_binding && rt.binding_thread == (unsigned long)pthread_self()) {
-            const int n = g_sdl_repair_attempts.fetch_add(1, std::memory_order_relaxed) + 1;
-            RepairSdlCurrentWindow();
-            if (n >= 8) g_sdl_repair_done = true;
-        }
-    }
 
     // A relaxed load first: exchange() is a write, and issuing one on every call
     // keeps this cache line bouncing between cores for the life of the process.

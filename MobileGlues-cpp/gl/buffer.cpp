@@ -745,9 +745,20 @@ void mg_flush_shadow_mappings() {
 
         // Resolve the driver-side name at flush time: the binding may have
         // changed since the mapping was installed.
-        GLuint real = mg_driver_bound_buffer(s.target);
+        const GLuint tracked = mg_driver_bound_buffer(s.target);
+        GLuint real = tracked;
         if (real == 0) real = find_real_buffer(find_bound_buffer(get_binding_query(s.target)));
         if (real == 0) continue;
+
+        // The tracked binding already says this target is bound to `real`, so
+        // there is nothing to save and nothing to restore: the glGetIntegerv and
+        // the two glBindBuffer calls that used to bracket every flush disappear.
+        // Only when the tracked state disagrees does it fall back to asking the
+        // driver, which is what this did unconditionally before.
+        if (tracked == real) {
+            GLES.glBufferSubData(s.target, s.offset, s.length, s.ptr);
+            continue;
+        }
 
         GLint previous = 0;
         if (GLES.glGetIntegerv) GLES.glGetIntegerv(get_binding_query(s.target), &previous);
@@ -801,14 +812,22 @@ bool ReleaseShadowMapping(GLenum target) {
 
     ScopedHostContext hostCtx;
     if (s.ptr && s.length > 0 && GLES.glBufferSubData && GLES.glBindBuffer) {
-        GLuint real = mg_driver_bound_buffer(s.target);
+        const GLuint tracked = mg_driver_bound_buffer(s.target);
+        GLuint real = tracked;
         if (real == 0) real = find_real_buffer(find_bound_buffer(get_binding_query(s.target)));
         if (real != 0) {
-            GLint previous = 0;
-            if (GLES.glGetIntegerv) GLES.glGetIntegerv(get_binding_query(s.target), &previous);
-            if ((GLuint)previous != real) GLES.glBindBuffer(s.target, real);
-            GLES.glBufferSubData(s.target, s.offset, s.length, s.ptr);
-            if ((GLuint)previous != real) GLES.glBindBuffer(s.target, (GLuint)previous);
+            // As in mg_flush_shadow_mappings: trust the tracked binding when it
+            // already points at the buffer being written, and only pay for a
+            // query plus two binds when it does not.
+            if (tracked == real) {
+                GLES.glBufferSubData(s.target, s.offset, s.length, s.ptr);
+            } else {
+                GLint previous = 0;
+                if (GLES.glGetIntegerv) GLES.glGetIntegerv(get_binding_query(s.target), &previous);
+                if ((GLuint)previous != real) GLES.glBindBuffer(s.target, real);
+                GLES.glBufferSubData(s.target, s.offset, s.length, s.ptr);
+                if ((GLuint)previous != real) GLES.glBindBuffer(s.target, (GLuint)previous);
+            }
         }
     }
 
@@ -862,10 +881,24 @@ void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitf
             }
         }
     }
+    // Flags that had to be dropped for the host to accept a mapping.
+    //
+    // glMapBufferRange is not a per-frame call in most programs but it is in
+    // this one: Minecraft maps and unmaps a buffer per chunk section upload, so
+    // a mapping the host refuses is refused a few thousand times a frame, and
+    // every refusal used to cost an extra rejected host call plus two
+    // LOG_W_FORCE lines -- a mutex, a vfprintf into latest.log and an
+    // android_log_print, each time. The first call still pays that and still
+    // reports it; from the second call on the flags that had to go are removed
+    // up front, so the happy path is one host call again.
+    static std::atomic<GLbitfield> g_map_access_drop{0};
+
     const GLbitfield requested = access;
 
-    // Drop whatever contradicts a persistent mapping before the first attempt.
+    // Drop whatever contradicts a persistent mapping before the first attempt,
+    // plus anything a previous call proved the host rejects.
     if (access & GL_MAP_PERSISTENT_BIT) access &= ~kPersistentConflictBits;
+    if (const GLbitfield known = g_map_access_drop.load(std::memory_order_relaxed)) access &= ~known;
 
     GLenum err = GL_NO_ERROR;
     void* ptr = TryMapBufferRange(target, offset, length, access, &err);
@@ -874,10 +907,17 @@ void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitf
     // Nothing. Minecraft turns the NULL into "IllegalStateException: Failed to
     // map buffer", so leave everything needed to identify the rejected
     // restriction in latest.log — including the GL error code, which the
-    // CHECK_GL_ERROR macro discards in release builds.
-    LOG_W_FORCE("glMapBufferRange failed: target=%s(0x%x) offset=%lld length=%lld requested=0x%x tried=0x%x "
-                "glError=0x%x",
-                glEnumToString(target), target, (long long)offset, (long long)length, requested, access, err);
+    // CHECK_GL_ERROR macro discards in release builds. Latched: this is the
+    // line that would otherwise be written once per refused mapping.
+    {
+        static bool warned_once = false;
+        if (!warned_once) {
+            warned_once = true;
+            LOG_W_FORCE("glMapBufferRange failed: target=%s(0x%x) offset=%lld length=%lld requested=0x%x tried=0x%x "
+                        "glError=0x%x (further refusals of this kind are not logged)",
+                        glEnumToString(target), target, (long long)offset, (long long)length, requested, access, err);
+        }
+    }
 
     // Retry without the persistence bits: if this buffer never actually got
     // immutable persistent storage (a driver that refused the flags, or a build
@@ -887,13 +927,26 @@ void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitf
         if (plain != access) {
             ptr = TryMapBufferRange(target, offset, length, plain, &err);
             if (ptr) {
-                LOG_W_FORCE("glMapBufferRange succeeded on retry without PERSISTENT/COHERENT "
-                            "(tried=0x%x); the buffer has no persistent storage",
-                            plain);
+                // Remember which flags the host would not take, so the next
+                // mapping of this kind is accepted on the first attempt instead
+                // of failing into this retry every single time.
+                g_map_access_drop.fetch_or(access & ~plain, std::memory_order_relaxed);
+                static bool warned_once = false;
+                if (!warned_once) {
+                    warned_once = true;
+                    LOG_W_FORCE("glMapBufferRange succeeded on retry without PERSISTENT/COHERENT "
+                                "(tried=0x%x); the buffer has no persistent storage. Later mappings drop these "
+                                "flags up front.",
+                                plain);
+                }
                 return ptr;
             }
-            LOG_W_FORCE("glMapBufferRange retry without PERSISTENT/COHERENT also failed (tried=0x%x glError=0x%x)",
-                        plain, err);
+            static bool failed_once = false;
+            if (!failed_once) {
+                failed_once = true;
+                LOG_W_FORCE("glMapBufferRange retry without PERSISTENT/COHERENT also failed (tried=0x%x glError=0x%x)",
+                            plain, err);
+            }
         }
     }
 
